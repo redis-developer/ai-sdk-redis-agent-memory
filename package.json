@@ -1,0 +1,73 @@
+{
+  "name": "ai-sdk-redis-agent-memory",
+  "version": "0.1.0",
+  "description": "AI SDK tools for Redis Agent Memory: session history, persistent memories, and semantic search",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/redis-developer/ai-sdk-redis-agent-memory.git"
+  },
+  "homepage": "https://github.com/redis-developer/ai-sdk-redis-agent-memory#readme",
+  "bugs": {
+    "url": "https://github.com/redis-developer/ai-sdk-redis-agent-memory/issues"
+  },
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "redis",
+    "agent-memory",
+    "memory",
+    "tools",
+    "typescript"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:package": "npm run build && node scripts/check-package.mjs",
+    "check": "npm run typecheck && npm test && npm run check:package",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "dependencies": {
+    "@redis-iris/agent-memory": "~0.3.1",
+    "@types/json-schema": "^7.0.15"
+  },
+  "peerDependencies": {
+    "ai": "^6.0.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "ai": "^6.0.291",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11",
+    "zod": "^4.6.5"
+  }
+}
