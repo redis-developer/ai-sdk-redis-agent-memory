@@ -1,8 +1,6 @@
-# ai-sdk-redis-agent-memory
+# Redis Agent Memory for Vercel's AI SDK
 
-Give an [AI SDK](https://ai-sdk.dev/) agent session history and persistent memory with ordinary tools backed by the official [`@redis-iris/agent-memory`](https://www.npmjs.com/package/@redis-iris/agent-memory) SDK.
-
-Use any AI SDK model provider. The memory integration does not require Vercel AI Gateway or Vercel hosting, and does not create its own language model.
+This integration provides short-term and long-term memory tools to agents that are developed with Vercel's [AI SDK](https://ai-sdk.dev/).
 
 ## Installation
 
