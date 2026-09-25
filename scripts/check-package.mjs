@@ -99,7 +99,7 @@ console.log('Verified installed ESM exports and tool construction without networ
   run([join(consumer, 'runtime.mjs')]);
 
   writeFileSync(join(consumer, 'consumer.ts'), `
-import type { ToolSet } from 'ai';
+import { ToolLoopAgent, isStepCount, type LanguageModel, type ToolSet } from 'ai';
 import {
   RedisAgentMemory, createIrisMemoryTools, irisMemoryInstructions, IrisToolError,
 } from ${packageName};
@@ -114,7 +114,15 @@ const tools: ToolSet = new RedisAgentMemory('fake-package-verification-key', opt
 const plainTools: ToolSet = createIrisMemoryTools('fake-package-verification-key', options);
 const instructions: string = irisMemoryInstructions;
 const error: Error = new IrisToolError('TEST', instructions);
-void [tools, plainTools, error];
+declare const model: LanguageModel;
+const agent = new ToolLoopAgent({
+  model, tools, instructions, stopWhen: isStepCount(8),
+});
+async function reply(): Promise<string> {
+  const result = await agent.generate({ prompt: 'Recall my preferences.' });
+  return result.finalStep.text;
+}
+void [tools, plainTools, error, reply];
 `);
   const compiler = join(consumer, 'node_modules', 'typescript', 'bin', 'tsc');
   const compilerArgs = [

@@ -60,12 +60,12 @@
     "@types/json-schema": "^7.0.15"
   },
   "peerDependencies": {
-    "ai": "^6.0.0",
-    "zod": "^4.0.0"
+    "ai": "^7.0.114",
+    "zod": "^4.1.8"
   },
   "devDependencies": {
     "@types/node": "^22.20.4",
-    "ai": "^6.0.291",
+    "ai": "^7.0.114",
     "typescript": "~5.9.3",
     "vitest": "^4.1.11",
     "zod": "^4.6.5"

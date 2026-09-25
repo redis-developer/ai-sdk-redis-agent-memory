@@ -4,23 +4,23 @@ This integration provides short-term and long-term memory tools to agents develo
 
 ## Installation
 
-Requires **Node.js 22+**, **AI SDK 6**, and **Zod 4**. This is a server-side, ESM-only package with TypeScript declarations.
+Requires **Node.js 22+**, **AI SDK 7.0.114+ (7.x)**, and **Zod 4.1.8+ (4.x)**. This is a server-side, ESM-only package with TypeScript declarations.
 
 After the first npm release:
 
 ```sh
-npm install ai-sdk-redis-agent-memory ai@^6 zod@^4
+npm install ai-sdk-redis-agent-memory ai@^7.0.114 zod@^4.1.8
 ```
 
 Before that release, [build and install a local tarball](#development). Provision a Redis Agent Memory store in [Redis Cloud](https://cloud.redis.io/#/agent-memory), then set `AGENT_MEMORY_API_KEY` and `AGENT_MEMORY_STORE_ID` in your server environment. Set `AGENT_MEMORY_URL` if your store uses a different endpoint.
 
 ## Quick start
 
-This example uses Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^3` and set `ANTHROPIC_API_KEY`. Other AI SDK model providers work with the same toolset.
+This example uses Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible model providers work with the same toolset.
 
 ```ts
 import { anthropic } from '@ai-sdk/anthropic';
-import { ToolLoopAgent, stepCountIs } from 'ai';
+import { ToolLoopAgent, isStepCount } from 'ai';
 import { RedisAgentMemory, irisMemoryInstructions } from 'ai-sdk-redis-agent-memory';
 
 // Your application supplies these from authenticated user/conversation state.
@@ -41,13 +41,13 @@ const agent = new ToolLoopAgent({
 Current user and memory owner: ${userId}
 Current session: ${sessionId}
 Current assistant actor: ${agentId}`,
-  stopWhen: stepCountIs(8),
+  stopWhen: isStepCount(8),
 });
 
 const result = await agent.generate({
   prompt: 'Remember that I prefer TypeScript examples.',
 });
-console.log(result.text);
+console.log(result.finalStep.text);
 ```
 
 The model decides when to use a memory tool. Instructions guide that decision; they do not force retrieval or storage on every turn. If your application requires every message to be recorded, call the official SDK from your request handler and tell the agent not to duplicate those events. This toolset does not automatically load conversation history into the model context.

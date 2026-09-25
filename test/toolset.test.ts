@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ToolLoopAgent, type ToolSet } from 'ai';
-import { MockLanguageModelV3 } from 'ai/test';
+import { ToolLoopAgent, isStepCount, type ToolSet } from 'ai';
+import { MockLanguageModelV4 } from 'ai/test';
 import { RedisAgentMemory, createIrisMemoryTools, irisMemoryInstructions } from '../src/index.js';
 
 const apiKey = 'test-secret-iris-key';
@@ -51,7 +51,7 @@ async function run(tools: ToolSet, name: string, input: unknown, abortSignal?: A
   if (!definition?.execute) throw new Error(`No executable tool named ${name}`);
   const schema = definition.inputSchema as { parseAsync(input: unknown): Promise<unknown> };
   const parsed = await schema.parseAsync(input);
-  return definition.execute(parsed, { toolCallId: 'test-call', messages: [], abortSignal });
+  return definition.execute(parsed, { toolCallId: 'test-call', messages: [], abortSignal, context: {} });
 }
 
 function toolsWith(fetch: typeof globalThis.fetch, options: ConstructorParameters<typeof RedisAgentMemory>[1] = {}) {
@@ -291,7 +291,7 @@ describe('RedisAgentMemory toolset', () => {
     expect(receivedSignal?.aborted).toBe(true);
   });
 
-  it('runs in a real ToolLoopAgent and sends memory results into the next model step', async () => {
+  it('runs an AI SDK 7 tool loop and separates intermediate text from the final memory-informed reply', async () => {
     const http = transport({ body: { items: [memory()] } });
     const tools = toolsWith(http.fetch, { scope: { ownerId: 'user-1' }, namespaceTools: true });
     const usage = {
@@ -299,7 +299,7 @@ describe('RedisAgentMemory toolset', () => {
       outputTokens: { total: 5, text: 5, reasoning: 0 },
     };
     let calls = 0;
-    const model = new MockLanguageModelV3({
+    const model = new MockLanguageModelV4({
       doGenerate: async options => {
         calls += 1;
         if (calls === 1) {
@@ -311,7 +311,10 @@ describe('RedisAgentMemory toolset', () => {
             if (definition.type === 'function') expect(definition.inputSchema.type).toBe('object');
           }
           return {
-            content: [{ type: 'tool-call', toolCallId: 'recall-1', toolName: 'search_memories', input: '{"text":"communication preferences"}' }],
+            content: [
+              { type: 'text', text: 'Let me check your saved preferences.' },
+              { type: 'tool-call', toolCallId: 'recall-1', toolName: 'search_memories', input: '{"text":"communication preferences"}' },
+            ],
             finishReason: { unified: 'tool-calls', raw: 'tool_calls' }, usage, warnings: [],
           };
         }
@@ -322,11 +325,13 @@ describe('RedisAgentMemory toolset', () => {
         };
       },
     });
-    const agent = new ToolLoopAgent({ model, tools, instructions: irisMemoryInstructions });
+    const agent = new ToolLoopAgent({ model, tools, instructions: irisMemoryInstructions, stopWhen: isStepCount(3) });
     const result = await agent.generate({ prompt: 'How do I prefer you to respond?' });
-    expect(result.text).toBe('I will keep my replies concise.');
+    expect(result.steps[0]?.text).toBe('Let me check your saved preferences.');
+    expect(result.finalStep.text).toBe('I will keep my replies concise.');
     expect(result.steps).toHaveLength(2);
     expect(http.requests).toHaveLength(1);
+    expect(http.requests[0]!.body.filter).toMatchObject({ ownerId: { eq: 'user-1' } });
     expect(calls).toBe(2);
   });
 });
