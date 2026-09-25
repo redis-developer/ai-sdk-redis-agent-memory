@@ -1,6 +1,6 @@
 # Redis Agent Memory for Vercel's AI SDK
 
-This integration provides short-term and long-term memory tools to agents that are developed with Vercel's [AI SDK](https://ai-sdk.dev/).
+This integration provides short-term and long-term memory tools to agents developed with Vercel's [AI SDK](https://ai-sdk.dev/).
 
 ## Installation
 
