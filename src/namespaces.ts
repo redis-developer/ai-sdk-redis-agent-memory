@@ -2,7 +2,7 @@ import { tool, type ToolSet } from "ai";
 import type { AgentMemory } from "@redis-iris/agent-memory";
 import type { Namespace } from "@redis-iris/agent-memory/models";
 import { z } from "zod";
-import { IrisToolError } from "./errors.js";
+import { RedisAgentMemoryToolError } from "./errors.js";
 
 export interface NamespaceToolOptions {
   ownerId?: string;
@@ -26,20 +26,20 @@ export function createNamespaceTools(
 
   function assertNamespaceId(namespaceId: string): void {
     if (options.namespaceId !== undefined && namespaceId !== options.namespaceId) {
-      throw new IrisToolError("INVALID_SCOPE", "This toolset is restricted to its configured namespace.");
+      throw new RedisAgentMemoryToolError("INVALID_SCOPE", "This toolset is restricted to its configured namespace.");
     }
   }
 
   async function assertOwner(namespace: Namespace, signal?: AbortSignal): Promise<void> {
     if (options.ownerId === undefined) return;
     if (namespace.scope !== "PERSONAL") {
-      throw new IrisToolError("INVALID_SCOPE", "This toolset can only access the configured owner's personal namespaces.");
+      throw new RedisAgentMemoryToolError("INVALID_SCOPE", "This toolset can only access the configured owner's personal namespaces.");
     }
     const root = namespace.namespaceId === namespace.rootId
       ? namespace
       : (await client.getNamespace(namespace.rootId, requestOptions(signal))).namespace;
     if (root.scope !== "PERSONAL" || root.ownerId !== options.ownerId) {
-      throw new IrisToolError("INVALID_SCOPE", "Namespace access is outside the configured owner scope.");
+      throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Namespace access is outside the configured owner scope.");
     }
   }
 
@@ -65,21 +65,21 @@ export function createNamespaceTools(
       execute: async (input, { abortSignal }) => {
         if (options.namespaceId !== undefined) {
           if (input.parentId !== undefined || input.scope !== undefined || input.ownerId !== undefined || input.pageToken !== undefined) {
-            throw new IrisToolError("INVALID_SCOPE", "Omit filters and pageToken when listing a fixed namespace.");
+            throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Omit filters and pageToken when listing a fixed namespace.");
           }
           return { items: [await assertNamespace(options.namespaceId, abortSignal)] };
         }
         if (input.parentId !== undefined && (input.scope !== undefined || input.ownerId !== undefined)) {
-          throw new IrisToolError("INVALID_SCOPE", "parentId cannot be combined with scope or ownerId.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "parentId cannot be combined with scope or ownerId.");
         }
         if (input.scope === "SHARED" && input.ownerId !== undefined) {
-          throw new IrisToolError("INVALID_SCOPE", "ownerId only applies to PERSONAL namespaces.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "ownerId only applies to PERSONAL namespaces.");
         }
         let scope = input.scope;
         let ownerId = input.ownerId;
         if (options.ownerId !== undefined) {
           if (scope === "SHARED" || (ownerId !== undefined && ownerId !== options.ownerId)) {
-            throw new IrisToolError("INVALID_SCOPE", "Namespace filters conflict with the configured owner scope.");
+            throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Namespace filters conflict with the configured owner scope.");
           }
           if (input.parentId === undefined) {
             scope = "PERSONAL";
@@ -126,14 +126,14 @@ export function createNamespaceTools(
       }),
       execute: async (input, { abortSignal }) => {
         if (options.namespaceId !== undefined) {
-          throw new IrisToolError("INVALID_SCOPE", "Cannot create namespaces from a toolset bound to a fixed namespace.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Cannot create namespaces from a toolset bound to a fixed namespace.");
         }
         if ((input.name === undefined) === (input.path === undefined)) {
-          throw new IrisToolError("INVALID_SCOPE", "Provide exactly one of name or path.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Provide exactly one of name or path.");
         }
         if (input.parentId !== undefined) {
           if (input.path !== undefined || input.scope !== undefined || input.ownerId !== undefined) {
-            throw new IrisToolError("INVALID_SCOPE", "Child creation requires name and parentId only.");
+            throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Child creation requires name and parentId only.");
           }
           await assertNamespace(input.parentId, abortSignal);
           return client.createNamespace(
@@ -145,17 +145,17 @@ export function createNamespaceTools(
         let ownerId = input.ownerId;
         if (options.ownerId !== undefined) {
           if (scope === "SHARED" || (ownerId !== undefined && ownerId !== options.ownerId)) {
-            throw new IrisToolError("INVALID_SCOPE", "Namespace creation conflicts with the configured owner scope.");
+            throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Namespace creation conflicts with the configured owner scope.");
           }
           scope = "PERSONAL";
           ownerId = options.ownerId;
         }
-        if (scope === undefined) throw new IrisToolError("INVALID_SCOPE", "Specify scope for a namespace root or hierarchy path.");
+        if (scope === undefined) throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Specify scope for a namespace root or hierarchy path.");
         if (scope === "PERSONAL" && ownerId === undefined) {
-          throw new IrisToolError("INVALID_SCOPE", "PERSONAL namespaces require ownerId.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "PERSONAL namespaces require ownerId.");
         }
         if (scope === "SHARED" && ownerId !== undefined) {
-          throw new IrisToolError("INVALID_SCOPE", "SHARED namespaces must omit ownerId.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "SHARED namespaces must omit ownerId.");
         }
         return client.createNamespace({ ...input, scope, ownerId }, requestOptions(abortSignal));
       },
@@ -172,7 +172,7 @@ export function createNamespaceTools(
       }),
       execute: async ({ namespaceId, ...body }, { abortSignal }) => {
         if (body.name === undefined && body.state === undefined) {
-          throw new IrisToolError("INVALID_SCOPE", "Provide a new name or state to update a namespace.");
+          throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Provide a new name or state to update a namespace.");
         }
         await assertNamespace(namespaceId, abortSignal);
         return client.updateNamespace(namespaceId, body, requestOptions(abortSignal));
@@ -189,7 +189,7 @@ export function createNamespaceTools(
       }),
       execute: async ({ memoryIds, namespaceId }, { abortSignal }) => {
         const namespace = await assertNamespace(namespaceId, abortSignal);
-        if (namespace.state !== "ACTIVE") throw new IrisToolError("INVALID_SCOPE", "Cannot move memories into an archived namespace.");
+        if (namespace.state !== "ACTIVE") throw new RedisAgentMemoryToolError("INVALID_SCOPE", "Cannot move memories into an archived namespace.");
         for (const memoryId of memoryIds) await options.assertMemory(memoryId, abortSignal);
         return client.moveLongTermMemories(
           { memoryIds, namespaceRef: { namespaceId } },

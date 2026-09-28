@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isStepCount, ToolLoopAgent } from 'ai';
 import { convertArrayToReadableStream, MockLanguageModelV4 } from 'ai/test';
 import { RedisAgentMemory, irisMemoryInstructions } from '../src/index.js';
+
+afterEach(() => vi.unstubAllGlobals());
 
 const usage = {
   inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
@@ -15,13 +17,13 @@ const recall = {
 };
 
 function memoryTools(fetch: typeof globalThis.fetch) {
-  return new RedisAgentMemory('fake-agent-execution-test-key', {
-    storeId: 'store-1',
-    serverURL: 'https://memory.example.test',
-    scope: { ownerId: 'user-1', sessionId: 'current-session' },
-    allowDeletes: false,
-    fetch,
-  });
+  vi.stubGlobal('fetch', fetch);
+  return new RedisAgentMemory(
+    'https://memory.example.test',
+    'store-1',
+    'fake-agent-execution-test-key',
+    { userId: 'user-1', sessionId: 'current-session' },
+  );
 }
 
 describe('AI SDK 7 agent execution', () => {

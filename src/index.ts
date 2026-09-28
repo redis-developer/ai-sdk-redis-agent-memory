@@ -1,66 +1,72 @@
 import { AgentMemory } from '@redis-iris/agent-memory';
-import { HTTPClient } from '@redis-iris/agent-memory/lib/http.js';
 import type { LongTermMemoryFilter } from '@redis-iris/agent-memory/models';
 import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import * as s from './schemas.js';
 import { createNamespaceTools } from './namespaces.js';
-import { IrisToolError } from './errors.js';
+import { RedisAgentMemoryToolError } from './errors.js';
 export { irisMemoryInstructions } from './instructions.js';
-export { IrisToolError } from './errors.js';
+export { RedisAgentMemoryToolError } from './errors.js';
 
-export interface IrisMemoryScope {
-  /** Stable user identity. Applied to all long-term operations and session ownership checks. */
-  ownerId?: string;
-  /** Locks session operations and associates new memories; recall still spans this owner's sessions. */
+export interface RedisAgentMemoryScope {
+  /** Stable application user ID. Used as the memory owner and as the actor for USER events. */
+  userId?: string;
+  /** Locks session operations and associates new memories; recall still spans this user's sessions. */
   sessionId?: string;
   /** Deprecated label; prefer namespaceId for resource-backed namespaces. */
   namespace?: string;
   namespaceId?: string;
 }
 export interface RedisAgentMemoryOptions {
-  storeId?: string;
-  serverURL?: string;
-  scope?: IrisMemoryScope;
-  /** Defaults to true. False removes destructive tools from the model's tool list. */
+  /** Expose deletion tools. Defaults to false. */
   allowDeletes?: boolean;
   /** Expose namespace administration tools. Defaults to false. */
   namespaceTools?: boolean;
+  /** HTTP request timeout in milliseconds. Defaults to 30,000. Must be positive and finite. */
   timeoutMs?: number;
-  /** Optional transport override for tests, tracing, or a proxy. No client instance is required. */
-  fetch?: typeof globalThis.fetch;
 }
 
-function fail(message: string): never { throw new IrisToolError('INVALID_SCOPE', message); }
+function fail(message: string): never { throw new RedisAgentMemoryToolError('INVALID_SCOPE', message); }
 function status(error: unknown): number | undefined {
   return typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
     ? error.statusCode : undefined;
 }
 
-/** Build ordinary AI SDK tools backed by the official Redis SDK. All credentials stay in closures. */
-export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemoryOptions = {}): ToolSet {
+/**
+ * Build ordinary AI SDK tools backed by the official Redis SDK. All credentials stay in closures.
+ * @param serverUrl Defaults to AGENT_MEMORY_URL, then the production US East endpoint.
+ * @param storeId Required here or through AGENT_MEMORY_STORE_ID.
+ * @param apiKey Required here or through AGENT_MEMORY_API_KEY.
+ * @param scope Fixed user, session, and namespace boundaries, copied at construction.
+ * @param options Deletion and namespace administration tools are disabled by default.
+ */
+export function createRedisAgentMemoryTools(
+  serverUrl?: string,
+  storeId?: string,
+  apiKey?: string,
+  scope: RedisAgentMemoryScope = {},
+  options: RedisAgentMemoryOptions = {},
+): ToolSet {
   const env = typeof process === 'undefined' ? {} : process.env;
   const key = apiKey ?? env.AGENT_MEMORY_API_KEY;
-  const storeId = options.storeId ?? env.AGENT_MEMORY_STORE_ID;
+  const resolvedStoreId = storeId ?? env.AGENT_MEMORY_STORE_ID;
   if (!key?.trim()) throw new Error('Set AGENT_MEMORY_API_KEY or pass an Iris API key.');
-  if (!storeId?.trim()) throw new Error('Set AGENT_MEMORY_STORE_ID or pass options.storeId.');
-  const serverURL = options.serverURL ?? env.AGENT_MEMORY_URL ?? 'https://gcp-us-east4.memory.redis.io';
+  if (!resolvedStoreId?.trim()) throw new Error('Set AGENT_MEMORY_STORE_ID or pass storeId.');
+  const serverURL = serverUrl ?? env.AGENT_MEMORY_URL ?? 'https://gcp-us-east4.memory.redis.io';
   const url = new URL(serverURL);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error('serverURL must be an HTTP(S) URL without credentials, query, or fragment.');
+    throw new Error('serverUrl must be an HTTP(S) URL without credentials, query, or fragment.');
   }
-  const scope = Object.freeze({ ...options.scope });
-  if (scope.ownerId !== undefined) s.ownerId.parse(scope.ownerId);
+  scope = Object.freeze({ ...scope });
+  if (scope.userId !== undefined) s.ownerId.parse(scope.userId);
   if (scope.sessionId !== undefined) s.sessionId.parse(scope.sessionId);
   if (scope.namespaceId !== undefined) s.id.parse(scope.namespaceId);
   if (scope.namespace !== undefined && !scope.namespace.trim()) throw new Error('scope.namespace must not be empty.');
   if (scope.namespace !== undefined && scope.namespaceId !== undefined) throw new Error('Choose scope.namespace or scope.namespaceId.');
   if (options.namespaceTools && scope.namespace !== undefined) throw new Error('Namespace resource tools cannot use a legacy namespace scope.');
   if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error('timeoutMs must be positive.');
-  const client = new AgentMemory({ apiKey: key, storeId, serverURL, timeoutMs: options.timeoutMs ?? 30_000,
-    ...(options.fetch ? { httpClient: new HTTPClient({ fetcher: options.fetch }) } : {}),
-  });
-  const deletes = options.allowDeletes ?? true;
+  const client = new AgentMemory({ apiKey: key, storeId: resolvedStoreId, serverURL, timeoutMs: options.timeoutMs ?? 30_000 });
+  const deletes = options.allowDeletes ?? false;
   type Placement = { namespace?: string; namespaceRef?: { namespaceId: string } };
   const checkPlacement = (value: Placement) => {
     if (value.namespace !== undefined && value.namespaceRef !== undefined) fail('Supply namespace or namespaceRef, never both.');
@@ -87,31 +93,31 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
     return resolved;
   };
   const resolveOwner = (value?: string) => {
-    if (scope.ownerId && value && value !== scope.ownerId) fail('Cannot override owner scope.');
-    const resolved = value ?? scope.ownerId;
-    if (!resolved) fail('Supply ownerId or configure scope.ownerId.');
+    if (scope.userId && value && value !== scope.userId) fail('Cannot override user scope.');
+    const resolved = value ?? scope.userId;
+    if (!resolved) fail('Supply ownerId or configure scope.userId.');
     return resolved;
   };
   const assertSession = async (sessionId: string, signal?: AbortSignal) => {
     resolveSession(sessionId);
     const session = await client.getSessionMemory(sessionId, false, { signal });
-    if (scope.ownerId && session.ownerId !== scope.ownerId) fail('Session is outside the configured owner scope.');
+    if (scope.userId && session.ownerId !== scope.userId) fail('Session is outside the configured user scope.');
     checkPlacement(session);
     return session;
   };
   const assertMemory = async (id: string, signal?: AbortSignal) => {
     const memory = await client.getLongTermMemory(id, { signal });
-    if (scope.ownerId && memory.ownerId !== scope.ownerId) fail('Memory is outside the configured owner scope.');
+    if (scope.userId && memory.ownerId !== scope.userId) fail('Memory is outside the configured user scope.');
     checkPlacement(memory);
     return memory;
   };
-  const hasResourceScope = Boolean(scope.ownerId || scope.namespace !== undefined || scope.namespaceId);
+  const hasResourceScope = Boolean(scope.userId || scope.namespace !== undefined || scope.namespaceId);
   const assertPlacementOwner = async (value: Placement, signal?: AbortSignal) => {
-    if (!scope.ownerId || !value.namespaceRef) return;
+    if (!scope.userId || !value.namespaceRef) return;
     const { namespace } = await client.getNamespace(value.namespaceRef.namespaceId, { signal });
     const root = namespace.rootId === namespace.namespaceId ? namespace
       : (await client.getNamespace(namespace.rootId, { signal })).namespace;
-    if (root.scope !== 'PERSONAL' || root.ownerId !== scope.ownerId) fail('Namespace placement is outside the configured owner’s personal namespaces.');
+    if (root.scope !== 'PERSONAL' || root.ownerId !== scope.userId) fail('Namespace placement is outside the configured user’s personal namespaces.');
   };
   const append = async (input: z.infer<typeof s.event>, signal?: AbortSignal, start = false) => {
     const placed = place(input);
@@ -124,11 +130,11 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
           if (start) fail('This session already exists; use add_session_event.');
         } catch (error) {
           if (status(error) !== 404) throw error;
-          if (scope.ownerId && (input.actorId !== scope.ownerId || input.role !== 'USER')) fail('A new session must start with a USER event whose actorId is the configured ownerId.');
+          if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) fail('A new session must start with a USER event whose actorId is the configured userId.');
         }
       }
-    } else if (scope.ownerId && (input.actorId !== scope.ownerId || input.role !== 'USER')) {
-      fail('A new session must start with a USER event whose actorId is the configured ownerId.');
+    } else if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) {
+      fail('A new session must start with a USER event whose actorId is the configured userId.');
     }
     await assertPlacementOwner(placed, signal);
     return client.addSessionEvent({ ...placed, sessionId, createdAt: input.createdAt ? new Date(input.createdAt) : new Date() }, { signal });
@@ -139,12 +145,13 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
     get_memory_context: tool({
       description: 'Get fixed memory scope and identity rules before using memory. Contains no credentials.',
       inputSchema: z.object({}), execute: async () => ({ ...scope, allowDeletes: deletes,
+        userIdentityRule: 'Use userId as ownerId for the user’s memories and actorId for USER events. ASSISTANT events use the agent’s actorId.',
         sessionOwnerRule: 'The first event actor becomes the immutable session owner. Start with the user.',
         longTermRecall: 'Search spans sessions unless an explicit session filter is supplied.',
       }),
     }),
     start_session: tool({
-      description: 'Start a conversation with the user’s first event. Iris generates and returns a session ID when none is provided. Retain the returned ID.',
+      description: 'Start a conversation with the user’s first event. Redis Agent Memory generates and returns a session ID when none is provided. Retain the returned ID.',
       inputSchema: z.object({ sessionId: s.sessionId.optional(), actorId: s.id, text: s.text, ...s.placement }),
       execute: (input, { abortSignal }) => append({ ...input, role: 'USER', content: [{ text: input.text }] }, abortSignal, true),
     }),
@@ -165,7 +172,7 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
       inputSchema: sessionInput.extend({ includeSummarisedEvents: z.boolean().optional() }),
       execute: async (input, { abortSignal }) => {
         const result = await client.getSessionMemory(resolveSession(input.sessionId), input.includeSummarisedEvents, { signal: abortSignal });
-        if (scope.ownerId && result.ownerId !== scope.ownerId) fail('Session is outside the configured owner scope.');
+        if (scope.userId && result.ownerId !== scope.userId) fail('Session is outside the configured user scope.');
         checkPlacement(result); return result;
       },
     }),
@@ -175,26 +182,26 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
         limit: z.number().int().min(1).max(1000).optional() }),
       execute: async (input, { abortSignal }) => {
         if (scope.sessionId) {
-          if (input.ownerId && scope.ownerId && input.ownerId !== scope.ownerId) fail('Cannot override owner scope.');
+          if (input.ownerId && scope.userId && input.ownerId !== scope.userId) fail('Cannot override user scope.');
           await assertSession(scope.sessionId, abortSignal);
           return { items: [scope.sessionId], total: 1 };
         }
         if (scope.namespace !== undefined || scope.namespaceId) fail('The Iris session-list API cannot filter namespaces. Use a known session ID with get_session_memory.');
-        if (input.includeAll && (scope.ownerId || input.ownerId)) fail('includeAll cannot be combined with an owner scope or ownerId.');
-        const owner = input.ownerId || scope.ownerId;
+        if (input.includeAll && (scope.userId || input.ownerId)) fail('includeAll cannot be combined with a user scope or ownerId.');
+        const owner = input.ownerId || scope.userId;
         if (!owner && !input.includeAll) fail('Supply ownerId or explicitly set includeAll: true.');
         if (owner) resolveOwner(owner);
         return client.listSessions(input.limit, input.pageToken, owner, owner ? undefined : true, { signal: abortSignal });
       },
     }),
     create_memories: tool({
-      description: 'Create 1–100 durable memories. Use stable unique IDs and the user’s ownerId. Inspect created and per-record errors before retrying.',
+      description: 'Create up to 100 durable memories in one batch. UUIDs are generated automatically; do not supply IDs. Use the user ID as ownerId; fixed scope.userId supplies it automatically. Returned memoryIds match input order; created and errors report outcomes. New calls generate new IDs, so reconcile uncertain writes before retrying.',
       inputSchema: z.object({ memories: z.array(s.memory).min(1).max(100) }),
       execute: async ({ memories }, { abortSignal }) => {
         const records = memories.map(memory => {
           const sessionId = memory.sessionId ?? scope.sessionId;
           if (scope.sessionId && sessionId !== scope.sessionId) fail('Cannot override session association.');
-          return { ...place(memory), ownerId: resolveOwner(memory.ownerId), sessionId };
+          return { ...place(memory), id: globalThis.crypto.randomUUID(), ownerId: resolveOwner(memory.ownerId), sessionId };
         });
         const checkedNamespaces = new Set<string>();
         for (const record of records) {
@@ -204,7 +211,8 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
             checkedNamespaces.add(namespaceId);
           }
         }
-        return client.bulkCreateLongTermMemories({ memories: records }, { signal: abortSignal });
+        const result = await client.bulkCreateLongTermMemories({ memories: records }, { signal: abortSignal });
+        return { ...result, memoryIds: records.map(record => record.id) };
       },
     }),
     get_memory: tool({
@@ -225,7 +233,7 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
           if (existing && (existing.eq !== value || Object.values(existing).filter(v => v !== undefined).length !== 1)) fail(`Cannot override ${name} scope.`);
           filter[name] = { eq: value };
         };
-        if (scope.ownerId) fixed('ownerId', scope.ownerId);
+        if (scope.userId) fixed('ownerId', scope.userId);
         if (scope.namespace !== undefined || scope.namespaceId) {
           if (filter.unnamespaced !== undefined) fail('Cannot search unnamespaced records within a namespace scope.');
           if (scope.namespace !== undefined) {
@@ -282,7 +290,7 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
     }),
   });
   if (options.namespaceTools) Object.assign(tools, createNamespaceTools(client, {
-    ownerId: scope.ownerId, namespaceId: scope.namespaceId, allowDeletes: deletes, assertMemory,
+    ownerId: scope.userId, namespaceId: scope.namespaceId, allowDeletes: deletes, assertMemory,
   }));
   // Errors from the generated SDK may contain response bodies and headers. Never expose these to the model.
   for (const entry of Object.values(tools)) {
@@ -291,9 +299,9 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
       try { return await execute(input, execution); }
       catch (error) {
         if (execution.abortSignal?.aborted) throw new DOMException('Memory operation aborted.', 'AbortError');
-        if (error instanceof IrisToolError) throw error;
+        if (error instanceof RedisAgentMemoryToolError) throw error;
         const code = status(error);
-        throw new IrisToolError(code ? `IRIS_HTTP_${code}` : 'IRIS_REQUEST_FAILED',
+        throw new RedisAgentMemoryToolError(code ? `IRIS_HTTP_${code}` : 'IRIS_REQUEST_FAILED',
           code ? `Iris request failed (HTTP ${code}). Check service configuration and request scope. Writes may have partially succeeded; verify before retrying.`
             : 'Iris request failed. Check connectivity and service configuration. Verify writes before retrying.', code);
       }
@@ -302,10 +310,16 @@ export function createIrisMemoryTools(apiKey?: string, options: RedisAgentMemory
   return tools;
 }
 
-/** Pass directly as `tools: new RedisAgentMemory(apiKey, options)`. Only tools are enumerable. */
+/** Pass directly as `tools: new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options)`. Only tools are enumerable. */
 export class RedisAgentMemory {
   [name: string]: ToolSet[string];
-  constructor(apiKey?: string, options: RedisAgentMemoryOptions = {}) {
-    Object.assign(this, createIrisMemoryTools(apiKey, options));
+  constructor(
+    serverUrl?: string,
+    storeId?: string,
+    apiKey?: string,
+    scope: RedisAgentMemoryScope = {},
+    options: RedisAgentMemoryOptions = {},
+  ) {
+    Object.assign(this, createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options));
   }
 }

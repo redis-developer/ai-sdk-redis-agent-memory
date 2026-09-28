@@ -71,29 +71,37 @@ try {
   writeFileSync(join(consumer, 'runtime.mjs'), `
 import assert from 'node:assert/strict';
 import {
-  RedisAgentMemory, createIrisMemoryTools, irisMemoryInstructions, IrisToolError,
+  RedisAgentMemory, createRedisAgentMemoryTools, irisMemoryInstructions, RedisAgentMemoryToolError,
 } from ${packageName};
 
 assert.equal(typeof RedisAgentMemory, 'function');
-assert.equal(typeof createIrisMemoryTools, 'function');
+assert.equal(typeof createRedisAgentMemoryTools, 'function');
 assert.equal(typeof irisMemoryInstructions, 'string');
 assert(irisMemoryInstructions.length > 0);
-assert(new IrisToolError('TEST', 'Consumer verification') instanceof Error);
+assert(new RedisAgentMemoryToolError('TEST', 'Consumer verification') instanceof Error);
 
-const options = {
-  storeId: 'package-test-store',
-  serverURL: 'https://memory.example.invalid',
-  scope: { ownerId: 'package-test-user', sessionId: 'package-test-session' },
-  allowDeletes: false,
-  fetch: async () => { throw new Error('Package verification must not call a memory server.'); },
-};
-const tools = new RedisAgentMemory('fake-package-verification-key', options);
-const plainTools = createIrisMemoryTools('fake-package-verification-key', options);
+globalThis.fetch = async () => { throw new Error('Package verification must not call a memory server.'); };
+const serverUrl = 'https://memory.example.invalid';
+const storeId = 'package-test-store';
+const apiKey = 'fake-package-verification-key';
+const scope = { userId: 'package-test-user', sessionId: 'package-test-session' };
+const tools = new RedisAgentMemory(serverUrl, storeId, apiKey, scope);
+const plainTools = createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope);
 assert.deepEqual(Object.keys(tools).sort(), Object.keys(plainTools).sort());
 for (const name of ['get_memory_context', 'add_session_event', 'get_memory', 'search_memories', 'create_memories']) {
   assert.equal(typeof tools[name]?.execute, 'function', name + ' must be executable');
 }
-assert.equal(tools.delete_memories, undefined);
+for (const name of ['delete_memories', 'delete_session_event', 'delete_session_memory',
+  'list_namespaces', 'get_namespace', 'create_namespace', 'update_namespace', 'move_memories', 'delete_namespace']) {
+  assert.equal(tools[name], undefined, name + ' must be disabled by default');
+}
+const enabledOptions = { allowDeletes: true, namespaceTools: true };
+const enabled = createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, enabledOptions);
+const enabledClass = new RedisAgentMemory(serverUrl, storeId, apiKey, scope, enabledOptions);
+assert.deepEqual(Object.keys(enabled).sort(), Object.keys(enabledClass).sort());
+assert.equal(typeof enabled.delete_memories?.execute, 'function');
+assert.equal(typeof enabled.create_namespace?.execute, 'function');
+assert.equal(typeof enabled.delete_namespace?.execute, 'function');
 console.log('Verified installed ESM exports and tool construction without network calls.');
 `);
   run([join(consumer, 'runtime.mjs')]);
@@ -101,19 +109,19 @@ console.log('Verified installed ESM exports and tool construction without networ
   writeFileSync(join(consumer, 'consumer.ts'), `
 import { ToolLoopAgent, isStepCount, type LanguageModel, type ToolSet } from 'ai';
 import {
-  RedisAgentMemory, createIrisMemoryTools, irisMemoryInstructions, IrisToolError,
+  RedisAgentMemory, createRedisAgentMemoryTools, irisMemoryInstructions, RedisAgentMemoryToolError,
+  type RedisAgentMemoryOptions, type RedisAgentMemoryScope,
 } from ${packageName};
 
-const options = {
-  storeId: 'package-test-store',
-  serverURL: 'https://memory.example.invalid',
-  scope: { ownerId: 'package-test-user', sessionId: 'package-test-session' },
-  allowDeletes: false,
-};
-const tools: ToolSet = new RedisAgentMemory('fake-package-verification-key', options);
-const plainTools: ToolSet = createIrisMemoryTools('fake-package-verification-key', options);
+const serverUrl = 'https://memory.example.invalid';
+const storeId = 'package-test-store';
+const apiKey = 'fake-package-verification-key';
+const scope: RedisAgentMemoryScope = { userId: 'package-test-user', sessionId: 'package-test-session' };
+const options: RedisAgentMemoryOptions = { allowDeletes: true, namespaceTools: true, timeoutMs: 5000 };
+const tools: ToolSet = new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options);
+const plainTools: ToolSet = createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options);
 const instructions: string = irisMemoryInstructions;
-const error: Error = new IrisToolError('TEST', instructions);
+const error: Error = new RedisAgentMemoryToolError('TEST', instructions);
 declare const model: LanguageModel;
 const agent = new ToolLoopAgent({
   model, tools, instructions, stopWhen: isStepCount(8),

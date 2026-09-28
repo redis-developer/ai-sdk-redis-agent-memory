@@ -19,9 +19,8 @@ export const event = z.object({
   ...placement,
 });
 export const memory = z.object({
-  id: id.describe('Stable unique memory ID. Reuse this ID if retrying the same creation.'),
   text,
-  ownerId: ownerId.optional().describe('Required unless the toolset has a fixed ownerId.'),
+  ownerId: ownerId.optional().describe('Memory owner’s user ID. Required unless the toolset has a fixed scope.userId.'),
   sessionId: sessionId.optional(),
   memoryType: z.string().min(1).optional().describe('Built-in or registered custom memory type.'),
   topics: topics.optional(),
