@@ -21,7 +21,7 @@ This example uses Anthropic directly; install its provider with `npm install @ai
 ```ts
 import { anthropic } from '@ai-sdk/anthropic';
 import { ToolLoopAgent, isStepCount } from 'ai';
-import { RedisAgentMemory, irisMemoryInstructions } from 'ai-sdk-redis-agent-memory';
+import { RedisAgentMemory, instructions } from 'ai-sdk-redis-agent-memory';
 
 // Your application supplies these from authenticated user/conversation state.
 const userId = 'user-123';
@@ -37,7 +37,7 @@ const agent = new ToolLoopAgent({
     process.env.AGENT_MEMORY_API_KEY,
     { userId, sessionId },
   ),
-  instructions: `${irisMemoryInstructions}
+  instructions: `${instructions}
 Current user and memory owner: ${userId}
 Current session: ${sessionId}
 Current assistant actor: ${agentId}`,
@@ -175,7 +175,7 @@ Attribute filters accept exactly one of `{string}`, `{number}`, `{boolean}`, or 
 
 `scope.userId` identifies the application user. The tools use that identity in role-specific fields: `ownerId` for the user's memories, sessions, and PERSONAL namespaces, and `actorId` for their USER events. Memory creation supplies `ownerId` automatically from `scope.userId`; session events still require an explicit `actorId`.
 
-Append `irisMemoryInstructions` to your agent's instructions and supply current user/agent/session IDs in trusted application context. A USER event uses the human user's ID as `actorId`; an ASSISTANT event uses the agent's ID. The first event establishes immutable session ownership, so initialize user-owned sessions with the user's message. With `scope.userId` set, the wrapper requires a new session to start with a USER event whose `actorId` matches that user ID.
+Append `instructions` to your agent's instructions and supply current user/agent/session IDs in trusted application context. A USER event uses the human user's ID as `actorId`; an ASSISTANT event uses the agent's ID. The first event establishes immutable session ownership, so initialize user-owned sessions with the user's message. With `scope.userId` set, the wrapper requires a new session to start with a USER event whose `actorId` matches that user ID.
 
 The host must retain session IDs between requests. An agent generating a session ID does not itself make that ID persistent across future model calls. Persist the IDs and conversation history in your application's storage and reuse them on subsequent requests.
 

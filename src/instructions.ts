@@ -1,5 +1,5 @@
 /** Append these to your agent's instructions; identity values belong to application context. */
-export const irisMemoryInstructions = `You have access to Redis Iris memory tools.
+export const instructions = `You have access to Redis Iris memory tools.
 Call get_memory_context to learn any fixed userId, session, and namespace scope.
 Use the stable userId supplied by the application as ownerId for that user's long-term memories and actorId for their USER events. A fixed scope.userId supplies ownerId automatically for memory creation; ASSISTANT events use the agent's actorId.
 Do not invent a replacement identity for an existing user. If no identity is available, ask the application/user for one before accessing personal memory.

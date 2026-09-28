@@ -9,7 +9,7 @@ if (Number(process.versions.node.split('.')[0]) < 22) {
   process.exit(1);
 }
 
-const [{ anthropic }, { ToolLoopAgent, isStepCount }, { RedisAgentMemory, irisMemoryInstructions }] =
+const [{ anthropic }, { ToolLoopAgent, isStepCount }, { RedisAgentMemory, instructions }] =
   await Promise.all([
     import('@ai-sdk/anthropic'),
     import('ai'),
@@ -61,7 +61,7 @@ function createConversation() {
     tools: memory,
     // onEnd records the turn; the model must not duplicate it.
     activeTools: ['get_memory_context', 'get_session_memory', 'create_memories', 'search_memories', 'update_memory'],
-    instructions: `${irisMemoryInstructions}
+    instructions: `${instructions}
 Current user and memory owner: ${userId}.
 Current session: ${sessionId}. Current assistant actor: demo-assistant.
 Keep replies concise. Use create_memories when asked to remember a fact, and

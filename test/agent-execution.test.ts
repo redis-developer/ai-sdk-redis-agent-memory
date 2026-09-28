@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isStepCount, ToolLoopAgent } from 'ai';
 import { convertArrayToReadableStream, MockLanguageModelV4 } from 'ai/test';
-import { RedisAgentMemory, irisMemoryInstructions } from '../src/index.js';
+import { RedisAgentMemory, instructions } from '../src/index.js';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -72,7 +72,7 @@ describe('AI SDK 7 agent execution', () => {
     const agent = new ToolLoopAgent({
       model,
       tools: memoryTools(fetch),
-      instructions: irisMemoryInstructions,
+      instructions,
       stopWhen: isStepCount(3),
     });
 
@@ -130,7 +130,7 @@ describe('AI SDK 7 agent execution', () => {
     const agent = new ToolLoopAgent({
       model,
       tools: memoryTools(fetch),
-      instructions: irisMemoryInstructions,
+      instructions,
       stopWhen: isStepCount(3),
     });
 

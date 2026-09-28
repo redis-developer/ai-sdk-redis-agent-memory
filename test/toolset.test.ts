@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ToolLoopAgent, isStepCount, type ToolSet } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import {
-  RedisAgentMemory, createRedisAgentMemoryTools, irisMemoryInstructions,
+  RedisAgentMemory, createRedisAgentMemoryTools, instructions,
   type RedisAgentMemoryOptions, type RedisAgentMemoryScope,
 } from '../src/index.js';
 
@@ -87,8 +87,8 @@ describe('RedisAgentMemory toolset', () => {
       expect(definition.description).toBeTypeOf('string');
     }
     expect(JSON.stringify(tools)).not.toContain(apiKey);
-    expect(irisMemoryInstructions).toBeTypeOf('string');
-    expect(irisMemoryInstructions.length).toBeGreaterThan(100);
+    expect(instructions).toBeTypeOf('string');
+    expect(instructions.length).toBeGreaterThan(100);
   });
 
   it.each([
@@ -495,7 +495,7 @@ describe('RedisAgentMemory toolset', () => {
         };
       },
     });
-    const agent = new ToolLoopAgent({ model, tools, instructions: irisMemoryInstructions, stopWhen: isStepCount(3) });
+    const agent = new ToolLoopAgent({ model, tools, instructions, stopWhen: isStepCount(3) });
     const result = await agent.generate({ prompt: 'How do I prefer you to respond?' });
     expect(result.steps[0]?.text).toBe('Let me check your saved preferences.');
     expect(result.finalStep.text).toBe('I will keep my replies concise.');

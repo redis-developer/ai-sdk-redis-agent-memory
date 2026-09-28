@@ -5,7 +5,7 @@ import { z } from 'zod';
 import * as s from './schemas.js';
 import { createNamespaceTools } from './namespaces.js';
 import { RedisAgentMemoryToolError } from './errors.js';
-export { irisMemoryInstructions } from './instructions.js';
+export { instructions } from './instructions.js';
 export { RedisAgentMemoryToolError } from './errors.js';
 
 export interface RedisAgentMemoryScope {
