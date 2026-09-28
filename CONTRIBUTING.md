@@ -29,6 +29,7 @@ Useful commands:
 src/                 Library implementation and public entry point
 test/                Unit and integration tests with mocked HTTP/model boundaries
 scripts/             Package validation tooling
+demo/                Minimal terminal chat (private; excluded from npm releases)
 dist/                Generated JavaScript, declarations, and maps (not committed)
 ```
 

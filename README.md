@@ -52,6 +52,13 @@ console.log(result.finalStep.text);
 
 The model decides when to use a memory tool. Instructions guide that decision; they do not force retrieval or storage on every turn. If your application requires every message to be recorded, call the official SDK from your request handler and tell the agent not to duplicate those events. This toolset does not automatically load conversation history into the model context.
 
+## Runnable demo
+
+See [demo/](https://github.com/redis-developer/ai-sdk-redis-agent-memory/tree/main/demo)
+for a minimal terminal chat using the local package. Save a preference, start a
+new conversation with `/new`, and watch the agent recall it from Redis. Setup
+instructions are in the demo README. The demo is excluded from npm releases.
+
 ## Combining tools
 
 The class implements the AI SDK `ToolSet` string index signature. Its own enumerable properties are exclusively tools; API credentials and the SDK client stay in closures. `createRedisAgentMemoryTools(serverUrl?, storeId?, apiKey?, scope?, options?)` returns an equivalent plain tool map, useful for spreading or selectively including tools:
