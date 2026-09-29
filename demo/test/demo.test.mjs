@@ -110,8 +110,8 @@ test('saving, /new, and recall use scoped Redis memory after clearing local hist
   assert.equal(result.requests.find(request => request.kind === 'create').body.memories[0].sessionId,
     events[0].sessionId, 'A durable memory is associated with its originating session.');
   assert.deepEqual(result.requests.filter(request => request.kind !== 'session-get').map(request => request.kind),
-    ['model', 'create', 'model', 'session-append', 'session-append',
-      'model', 'search', 'model', 'session-append', 'session-append']);
+    ['session-append', 'model', 'create', 'model', 'session-append',
+      'session-append', 'model', 'search', 'model', 'session-append']);
   assert.ok(result.stdout.includes(`Session: ${events[0].sessionId}`));
   assert.ok(result.stdout.includes(`Session: ${events[2].sessionId}`));
   assert.match(result.stdout, /Assistant: Saved your preference\./);
@@ -132,15 +132,15 @@ test('follow-up turns retain local history and append to the same Redis session'
   assert.equal(result.stderr, '');
 });
 
-test('completed turns await sequential session writes and persist only final assistant text', () => {
+test('each turn awaits its USER write before generation and its final ASSISTANT write before displaying the reply', () => {
   const result = runDemo(`${remember}\n${recall}\n/quit\n`, { DEMO_TEST_SCENARIO: 'slow-session-events' });
   assertSavedAndRecalled(result, { freshHistory: false });
   assertSessionEvents(result, ['USER', 'ASSISTANT', 'USER', 'ASSISTANT'],
     [remember, 'Saved your preference.', recall, 'You prefer TypeScript examples.']);
   assert.deepEqual(result.requests.filter(request => request.kind !== 'session-get').map(request => request.kind),
-    ['model', 'create', 'model', 'session-append', 'session-append-complete',
+    ['session-append', 'session-append-complete', 'model', 'create', 'model',
       'session-append', 'session-append-complete',
-      'model', 'search', 'model', 'session-append', 'session-append-complete',
+      'session-append', 'session-append-complete', 'model', 'search', 'model',
       'session-append', 'session-append-complete']);
   const savedReplies = [...result.stdout.matchAll(/ASSISTANT session event saved\./g)].map(match => match.index);
   const displayedReplies = [...result.stdout.matchAll(/Assistant:/g)].map(match => match.index);
@@ -151,28 +151,108 @@ test('completed turns await sequential session writes and persist only final ass
   assert.equal(result.stderr, '');
 });
 
-test('failed generation records no session events and does not replay the failed turn', () => {
+test('failed generation retains its USER event without saving an ASSISTANT event or replaying the failed turn', () => {
   const result = runDemo(`${remember}\n${recall}\n/quit\n`, { DEMO_TEST_SCENARIO: 'failed-reply' });
   assertSavedAndRecalled(result);
-  const events = assertSessionEvents(result, ['USER', 'ASSISTANT'],
-    [recall, 'You prefer TypeScript examples.']);
+  const events = assertSessionEvents(result, ['USER', 'USER', 'ASSISTANT'],
+    [remember, recall, 'You prefer TypeScript examples.']);
   assert.equal(new Set(events.map(event => event.sessionId)).size, 1);
+  assert.deepEqual(result.requests.filter(request => request.kind !== 'session-get').map(request => request.kind),
+    ['session-append', 'model', 'create', 'model',
+      'session-append', 'model', 'search', 'model', 'session-append']);
   assert.match(result.stderr, /Request failed/);
+  assert.match(result.stderr, /HTTP\s*500/);
+  assert.match(result.stderr, /Injected failure after the memory write/);
   assert.match(result.stderr, /memory write may have succeeded/i);
   assert.doesNotMatch(result.stdout, /Assistant: Saved your preference\./);
 });
 
-test('an uncertain user append skips its assistant event and retains the reply without replay', () => {
+test('provider authentication diagnostics show HTTP status while redacting credentials and omitting response bodies and headers', () => {
+  const anthropicKey = '  fake-anthropic-key+/=  ';
+  const redisKey = '  fake-redis-key+/=  ';
+  const prompt = 'diagnostic-input-private-sentinel';
+  const result = runDemo(`${prompt}\n/quit\n`, {
+    DEMO_TEST_SCENARIO: 'provider-unauthorized',
+    ANTHROPIC_API_KEY: anthropicKey,
+    AGENT_MEMORY_API_KEY: redisKey,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assertSessionEvents(result, ['USER'], [prompt]);
+  assert.equal(result.requests.filter(request => request.kind === 'model').length, 1, 'Failed model requests are not retried.');
+  assert.match(result.stderr, /Request failed/);
+  assert.match(result.stderr, /HTTP\s*401/);
+  assert.match(result.stderr, /Invalid API key/);
+  assert.match(result.stderr, /Anthropic/i);
+  assert.match(result.stderr, /ANTHROPIC_API_KEY/);
+  assert.match(result.stderr, /check|replace|verify/i);
+  const output = result.stdout + result.stderr;
+  for (const key of [anthropicKey, redisKey]) {
+    for (const variant of [key, key.trim(), encodeURIComponent(key), encodeURIComponent(key.trim())]) {
+      assert.equal(output.includes(variant), false, 'Configured credentials must not appear in diagnostic output.');
+    }
+  }
+  for (const privateValue of ['private-response-body-sentinel', 'private-response-header-sentinel', prompt]) {
+    assert.equal(output.includes(privateValue), false, 'Diagnostics must not dump HTTP bodies, headers, or input messages.');
+  }
+  assert.doesNotMatch(output, /[\x1b\x07]/, 'Provider text must not emit terminal controls.');
+});
+
+test('invalid model requests report the provider message and HTTP status without retrying', () => {
+  const result = runDemo(`${remember}\n/quit\n`, { DEMO_TEST_SCENARIO: 'provider-invalid-request' });
+  assert.equal(result.status, 0, result.stderr);
+  assertSessionEvents(result, ['USER'], [remember]);
+  assert.equal(result.requests.filter(request => request.kind === 'model').length, 1);
+  assert.match(result.stderr, /HTTP\s*400/);
+  assert.match(result.stderr, /messages\.0\.content\.0\.type: Invalid message content\./);
+  assert.match(result.stderr, /Anthropic/i);
+  assert.match(result.stderr, /check|review|inspect|fix/i);
+});
+
+for (const scenario of [
+  { name: 'service outage', fixture: 'provider-unavailable', status: 503, message: /Service Unavailable/i, action: /wait|later|status\.(?:anthropic|claude)\.com/i },
+  { name: 'rate limit', fixture: 'provider-rate-limited', status: 429, message: /request rate limit/i, action: /wait|usage|quota|billing|reduce/i },
+  { name: 'missing model', fixture: 'provider-model-missing', status: 404, message: /model: unavailable-model/, action: /ANTHROPIC_MODEL/ },
+]) {
+  test(`Anthropic ${scenario.name} reports a specific next step without retrying or losing the USER event`, () => {
+    const result = runDemo(`${remember}\n/quit\n`, { DEMO_TEST_SCENARIO: scenario.fixture });
+    assert.equal(result.status, 0, result.stderr);
+    assertSessionEvents(result, ['USER'], [remember]);
+    assert.equal(result.requests.filter(request => request.kind === 'model').length, 1);
+    assert.match(result.stderr, /Request failed/);
+    assert.match(result.stderr, /Anthropic/i);
+    assert.match(result.stderr, new RegExp(`HTTP\\s*${scenario.status}`));
+    assert.match(result.stderr, scenario.message);
+    assert.match(result.stderr, scenario.action);
+  });
+}
+
+test('network diagnostics expose the nested DNS failure without retrying the model request', () => {
+  const result = runDemo(`${remember}\n/quit\n`, { DEMO_TEST_SCENARIO: 'provider-network-failure' });
+  assert.equal(result.status, 0, result.stderr);
+  assertSessionEvents(result, ['USER'], [remember]);
+  assert.equal(result.requests.filter(request => request.kind === 'model').length, 1);
+  assert.match(result.stderr, /Request failed/);
+  assert.match(result.stderr, /ENOTFOUND/);
+  assert.match(result.stderr, /api\.anthropic\.com/);
+  assert.match(result.stderr, /check|verify/i);
+  assert.match(result.stderr, /DNS|network|internet|proxy|VPN/i);
+});
+
+test('an uncertain USER append does not suppress the independent ASSISTANT write or replay either event', () => {
   const result = runDemo(`${remember}\n${recall}\n/quit\n`, { DEMO_TEST_SCENARIO: 'failed-user-event', FORCE_COLOR: '1' });
   assertSavedAndRecalled(result, { freshHistory: false });
-  const events = assertSessionEvents(result, ['USER', 'USER', 'ASSISTANT'],
-    [remember, recall, 'You prefer TypeScript examples.']);
+  const events = assertSessionEvents(result, ['USER', 'ASSISTANT', 'USER', 'ASSISTANT'],
+    [remember, 'Saved your preference.', recall, 'You prefer TypeScript examples.']);
   assert.equal(new Set(events.map(event => event.sessionId)).size, 1);
   assert.match(result.stderr, /session|event/i);
   assert.match(result.stderr, /\x1b\[31m[^\n]*\[memory\]/, 'Failed memory calls appear in red.');
   assert.match(result.stdout, /Assistant: Saved your preference\./);
   assert.match(result.stderr, /not confirmed/i);
   assert.match(result.stderr, /may already be stored/i);
+  assert.match(result.stderr, /IRIS_HTTP_500/);
+  assert.match(result.stderr, /Iris request failed \(HTTP 500\)/);
+  assert.match(result.stderr, /Redis[^\n]*USER|USER[^\n]*Redis/i);
+  assert.doesNotMatch(result.stderr, /Anthropic/i, 'A Redis session failure must not be described as a model-provider failure.');
 });
 
 test('an uncertain assistant event append retains the reply and conversation without replaying it', () => {
@@ -185,6 +265,8 @@ test('an uncertain assistant event append retains the reply and conversation wit
   assert.match(result.stderr, /session|event/i);
   assert.match(result.stderr, /not confirmed/i);
   assert.match(result.stderr, /may already be stored/i);
+  assert.match(result.stderr, /Redis[^\n]*ASSISTANT|ASSISTANT[^\n]*Redis/i);
+  assert.doesNotMatch(result.stderr, /Anthropic/i);
 });
 
 test('an empty final reply does not write a fabricated assistant session event', () => {

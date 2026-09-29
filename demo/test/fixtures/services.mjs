@@ -27,6 +27,39 @@ globalThis.fetch = async (input, init) => {
     record({ kind: 'model', ...entry });
     modelCalls += 1;
     if (modelCalls === 1) {
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-unauthorized') {
+        const keys = [process.env.ANTHROPIC_API_KEY, process.env.AGENT_MEMORY_API_KEY];
+        const reflectedKeys = keys.flatMap(key => [key, key.trim(), encodeURIComponent(key), encodeURIComponent(key.trim())]);
+        return Response.json({
+          type: 'error',
+          error: { type: 'authentication_error', message: `\x1b[31mInvalid API key.\x1b[0m\x07 Reflected credentials: ${reflectedKeys.join(' | ')}` },
+          privateDetails: 'private-response-body-sentinel',
+        }, { status: 401, headers: { 'x-private-diagnostic': 'private-response-header-sentinel' } });
+      }
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-invalid-request') {
+        return Response.json({
+          type: 'error', error: { type: 'invalid_request_error', message: 'messages.0.content.0.type: Invalid message content.' },
+        }, { status: 400 });
+      }
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-unavailable') {
+        return new Response('Service Unavailable', {
+          status: 503, statusText: 'Service Unavailable', headers: { 'content-type': 'text/plain' },
+        });
+      }
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-rate-limited') {
+        return Response.json({
+          type: 'error', error: { type: 'rate_limit_error', message: 'Your account has reached its request rate limit.' },
+        }, { status: 429 });
+      }
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-model-missing') {
+        return Response.json({
+          type: 'error', error: { type: 'not_found_error', message: 'model: unavailable-model' },
+        }, { status: 404 });
+      }
+      if (process.env.DEMO_TEST_SCENARIO === 'provider-network-failure') {
+        const cause = Object.assign(new Error('getaddrinfo ENOTFOUND api.anthropic.com'), { code: 'ENOTFOUND' });
+        throw new TypeError('fetch failed', { cause });
+      }
       return reply([{ type: 'text', text: 'I will save that preference.' }, {
         type: 'tool_use', id: 'save-1', name: 'create_memories',
         input: { memories: [{ text: 'The user prefers TypeScript examples.' }] },

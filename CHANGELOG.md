@@ -10,6 +10,12 @@
 - Automatically generate UUIDs for new memories and return their IDs in input
   order alongside per-record outcomes.
 - Fixed user, session, and namespace scopes; optional namespace administration.
+- Non-mutating `withContext(scope)` on class instances and factory results creates
+  independent scoped tools sharing one client, while preserving fixed boundaries.
+- Non-enumerable `createSessionEventHook(options)` creates scoped USER `onStart`
+  and ASSISTANT `onEnd` callbacks, with explicit actor IDs, error reporting, and
+  optional event observers. The demo records user input before model execution
+  and the final assistant reply after completion.
 - Public `scope.userId` maps to Redis ownership fields and identifies the actor
   for USER events.
 - Positional factory and constructor arguments: `serverUrl`, `storeId`, `apiKey`,

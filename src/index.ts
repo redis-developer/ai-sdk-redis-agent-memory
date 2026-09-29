@@ -4,9 +4,14 @@ import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import * as s from './schemas.js';
 import { createNamespaceTools } from './namespaces.js';
-import { RedisAgentMemoryToolError } from './errors.js';
+import { RedisAgentMemoryToolError, sanitizeMemoryError } from './errors.js';
+import { createSessionEventHook, type SessionEventHook, type SessionEventHookOptions } from './session-event-hook.js';
 export { instructions } from './instructions.js';
 export { RedisAgentMemoryToolError } from './errors.js';
+export type {
+  SessionEventHook, SessionEventHookInput, SessionEventHookOptions,
+  SessionHookEvent, SessionEventHookErrorContext,
+} from './session-event-hook.js';
 
 export interface RedisAgentMemoryScope {
   /** Stable application user ID. Used as the memory owner and as the actor for USER events. */
@@ -26,10 +31,39 @@ export interface RedisAgentMemoryOptions {
   timeoutMs?: number;
 }
 
+/** A tool map with non-enumerable helpers for scoping and application session recording. */
+export type RedisAgentMemoryTools = ToolSet & {
+  readonly withContext: (scope: RedisAgentMemoryScope) => RedisAgentMemoryTools;
+  /** Record USER text in onStart or ASSISTANT text in onEnd. Requires fixed userId/sessionId. */
+  readonly createSessionEventHook: <Role extends SessionEventHookOptions['role']>(options: SessionEventHookOptions<Role>) => SessionEventHook<Role>;
+};
+
 function fail(message: string): never { throw new RedisAgentMemoryToolError('INVALID_SCOPE', message); }
 function status(error: unknown): number | undefined {
   return typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
     ? error.statusCode : undefined;
+}
+
+function copyScope(scope: RedisAgentMemoryScope, options: RedisAgentMemoryOptions): Readonly<RedisAgentMemoryScope> {
+  scope = Object.freeze({ ...scope });
+  if (scope.userId !== undefined) s.ownerId.parse(scope.userId);
+  if (scope.sessionId !== undefined) s.sessionId.parse(scope.sessionId);
+  if (scope.namespaceId !== undefined) s.id.parse(scope.namespaceId);
+  if (scope.namespace !== undefined && !scope.namespace.trim()) throw new Error('scope.namespace must not be empty.');
+  if (scope.namespace !== undefined && scope.namespaceId !== undefined) throw new Error('Choose scope.namespace or scope.namespaceId.');
+  if (options.namespaceTools && scope.namespace !== undefined) throw new Error('Namespace resource tools cannot use a legacy namespace scope.');
+  return scope;
+}
+
+function extendScope(scope: RedisAgentMemoryScope, context: RedisAgentMemoryScope): RedisAgentMemoryScope {
+  const extended = { ...scope };
+  for (const name of ['userId', 'sessionId', 'namespace', 'namespaceId'] as const) {
+    const value = context[name];
+    if (value === undefined) continue;
+    if (scope[name] !== undefined && scope[name] !== value) fail(`Cannot override ${name} scope.`);
+    extended[name] = value;
+  }
+  return extended;
 }
 
 /**
@@ -46,7 +80,7 @@ export function createRedisAgentMemoryTools(
   apiKey?: string,
   scope: RedisAgentMemoryScope = {},
   options: RedisAgentMemoryOptions = {},
-): ToolSet {
+): RedisAgentMemoryTools {
   const env = typeof process === 'undefined' ? {} : process.env;
   const key = apiKey ?? env.AGENT_MEMORY_API_KEY;
   const resolvedStoreId = storeId ?? env.AGENT_MEMORY_STORE_ID;
@@ -57,15 +91,18 @@ export function createRedisAgentMemoryTools(
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error('serverUrl must be an HTTP(S) URL without credentials, query, or fragment.');
   }
-  scope = Object.freeze({ ...scope });
-  if (scope.userId !== undefined) s.ownerId.parse(scope.userId);
-  if (scope.sessionId !== undefined) s.sessionId.parse(scope.sessionId);
-  if (scope.namespaceId !== undefined) s.id.parse(scope.namespaceId);
-  if (scope.namespace !== undefined && !scope.namespace.trim()) throw new Error('scope.namespace must not be empty.');
-  if (scope.namespace !== undefined && scope.namespaceId !== undefined) throw new Error('Choose scope.namespace or scope.namespaceId.');
-  if (options.namespaceTools && scope.namespace !== undefined) throw new Error('Namespace resource tools cannot use a legacy namespace scope.');
+  options = Object.freeze({ ...options });
+  scope = copyScope(scope, options);
   if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error('timeoutMs must be positive.');
   const client = new AgentMemory({ apiKey: key, storeId: resolvedStoreId, serverURL, timeoutMs: options.timeoutMs ?? 30_000 });
+  return buildTools(client, scope, options);
+}
+
+function buildTools(
+  client: AgentMemory,
+  scope: Readonly<RedisAgentMemoryScope>,
+  options: Readonly<RedisAgentMemoryOptions>,
+): RedisAgentMemoryTools {
   const deletes = options.allowDeletes ?? false;
   type Placement = { namespace?: string; namespaceRef?: { namespaceId: string } };
   const checkPlacement = (value: Placement) => {
@@ -299,20 +336,23 @@ export function createRedisAgentMemoryTools(
       try { return await execute(input, execution); }
       catch (error) {
         if (execution.abortSignal?.aborted) throw new DOMException('Memory operation aborted.', 'AbortError');
-        if (error instanceof RedisAgentMemoryToolError) throw error;
-        const code = status(error);
-        throw new RedisAgentMemoryToolError(code ? `IRIS_HTTP_${code}` : 'IRIS_REQUEST_FAILED',
-          code ? `Iris request failed (HTTP ${code}). Check service configuration and request scope. Writes may have partially succeeded; verify before retrying.`
-            : 'Iris request failed. Check connectivity and service configuration. Verify writes before retrying.', code);
+        throw sanitizeMemoryError(error);
       }
     };
   }
-  return tools;
+  // Keep application helpers out of AI SDK tool enumeration and object spreads.
+  Object.defineProperties(tools, {
+    withContext: {
+      value: (context: RedisAgentMemoryScope) => buildTools(client, copyScope(extendScope(scope, context), options), options),
+    },
+    createSessionEventHook: {
+      value: (hookOptions: SessionEventHookOptions) => createSessionEventHook(scope, append, hookOptions),
+    },
+  });
+  return tools as RedisAgentMemoryTools;
 }
 
-/** Pass directly as `tools: new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options)`. Only tools are enumerable. */
-export class RedisAgentMemory {
-  [name: string]: ToolSet[string];
+const RedisAgentMemoryConstructor = class RedisAgentMemory {
   constructor(
     serverUrl?: string,
     storeId?: string,
@@ -320,6 +360,17 @@ export class RedisAgentMemory {
     scope: RedisAgentMemoryScope = {},
     options: RedisAgentMemoryOptions = {},
   ) {
-    Object.assign(this, createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options));
+    Object.defineProperties(this, Object.getOwnPropertyDescriptors(
+      createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options),
+    ));
   }
-}
+};
+
+export type RedisAgentMemory = RedisAgentMemoryTools;
+
+// Expose the tool-map intersection at the constructor boundary so withContext remains a method, not a tool.
+/** Pass directly as `tools: new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options)`. Only tools are enumerable. */
+export const RedisAgentMemory = RedisAgentMemoryConstructor as unknown as {
+  new (...args: ConstructorParameters<typeof RedisAgentMemoryConstructor>): RedisAgentMemory;
+  readonly prototype: RedisAgentMemory;
+};

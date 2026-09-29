@@ -2,7 +2,7 @@
 
 A terminal chat using `ai-sdk-redis-agent-memory`, AI SDK, and Anthropic. It stores
 user messages and assistant replies as Redis session events, and saves durable
-facts for recall after you clear the chat or restart the app. Tool calls and
+facts for recall after you start a new conversation or restart the app. Tool calls and
 results are printed in cyan as `[memory] ...`; failures are red.
 
 ## Run
@@ -46,10 +46,10 @@ disables colors; `NO_COLOR` takes precedence.
 
 ```text
 You: Remember that I prefer TypeScript examples.
-  [memory] create_memories
-  [memory] 1 saved; 0 failed.
   [memory] add_session_event (USER)
   [memory] USER session event saved.
+  [memory] create_memories
+  [memory] 1 saved; 0 failed.
   [memory] add_session_event (ASSISTANT)
   [memory] ASSISTANT session event saved.
 Assistant: ...
@@ -57,10 +57,10 @@ You: /new
 New conversation. Saved sessions and memories remain in Redis.
 Session: <new session ID>
 You: Which programming language do I prefer for examples?
-  [memory] search_memories
-  [memory] 1 found.
   [memory] add_session_event (USER)
   [memory] USER session event saved.
+  [memory] search_memories
+  [memory] 1 found.
   [memory] add_session_event (ASSISTANT)
   [memory] ASSISTANT session event saved.
 Assistant: ...
@@ -68,19 +68,59 @@ Assistant: ...
 
 `/new` clears all messages and tool results from the model's local conversation
 and generates a new session ID; saved sessions and long-term memories remain in
-Redis according to your store's retention settings. `/quit` exits. Restarting
-also starts a fresh session. Keep the same `DEMO_USER_ID` (default:
+Redis according to your store's retention settings. `/clear` clears the terminal
+screen while keeping the current conversation, session, and saved memories.
+It makes no API calls and has no effect on piped output. `/quit` exits.
+Restarting also starts a fresh session. Keep the same `DEMO_USER_ID` (default:
 `demo-user`) to recall your memories, or change it to try a different user. This
 is a local demo; the user ID is configuration, not authentication.
 
-The session ID is printed at startup and after `/new`. After each completed
-generation, the agent's `onEnd` hook calls `add_session_event` directly: first
-for the latest user message, then for `finalStep.text`. It uses the user ID for
-`USER` events and `demo-assistant` for `ASSISTANT` events. This runs once per
-turn, so intermediate tool steps don't create duplicate events. The model can
-read earlier completed turns with `get_session_memory`; the current turn is
-saved only after generation finishes. Tool calls and results stay in local
-model history.
+The demo creates one memory toolset with `createRedisAgentMemoryTools`, binding
+the stable user ID once. Each conversation calls `memory.withContext({ sessionId })`
+to get its own scoped tools while sharing the original client.
+
+The session ID is printed at startup and after `/new`. The agent uses the
+toolset's session event hooks with shared logging callbacks:
+
+```js
+const sessionObservers = {
+  onEventStart: ({ role }) => logMemory(`add_session_event (${role})`),
+  onEventSaved: ({ role }) => logMemory(`${role} session event saved.`),
+  onError: (error, { role, phase }) => {
+    logMemoryError(`${role} session save failed`, error);
+    if (phase === 'write') {
+      logMemory('Session save was not confirmed; the event may already be stored. Verify before retrying.', true);
+    }
+  },
+};
+
+const agent = new ToolLoopAgent({
+  model,
+  tools,
+  onStart: tools.createSessionEventHook({
+    ...sessionObservers, role: 'USER', actorId: userId,
+  }),
+  onEnd: tools.createSessionEventHook({
+    ...sessionObservers, role: 'ASSISTANT', actorId: 'demo-assistant',
+  }),
+  // Other agent options omitted here.
+});
+```
+
+`onStart` records the current user message before the model runs. Its actor ID
+must match the scoped user ID. After generation completes, `onEnd` records
+`finalStep.text` with `demo-assistant` as its actor. Empty assistant replies are
+skipped. Each hook runs once per turn; intermediate steps do not create events.
+No `include.requestMessages` setting is needed.
+Session-write tools are excluded from `activeTools` so the model does not
+duplicate those events. Hook writes use their own event observers for logging;
+they do not trigger the AI SDK's tool-execution callbacks.
+
+The model can read saved history with `get_session_memory`, including the
+current user message once its save succeeds. Tool calls and results stay in
+local model history. The helpers record text only; see the library's
+[session event hook documentation](../README.md#recording-session-events) for
+input requirements and error context.
 
 The model chooses when to save and search long-term facts. New memories are
 associated with the current session, while recall searches across the user's
@@ -89,11 +129,32 @@ memories may take a moment to become searchable. Your store may also summarize
 sessions and extract long-term facts in the background if configured to do so.
 Deletion tools are disabled.
 
-If a session write fails, the remaining writes for that turn stop and the reply
-still appears in the local chat. Writes aren't automatically retried because an
-event may already have been stored. Failed generations don't run `onEnd`, so
-neither side of a failed turn is saved as a session event. A long-term memory
-write may still have succeeded; ask the agent to recall it before saving again.
+The hooks report save failures through their required `onError` callback;
+AI SDK ignores lifecycle callback exceptions. A USER save failure does not
+stop generation or the independent ASSISTANT hook. An uncertain user write may
+already have committed, allowing the assistant event to be saved afterward.
+Writes are not atomic, retried, or deduplicated. If generation fails before
+`onEnd`, the saved USER message remains in Redis and no ASSISTANT event is recorded.
+A long-term memory write may also have succeeded; ask the agent to recall it
+before saving again.
+
+When a request fails, the demo identifies Anthropic or Redis when the error's
+source is known, preserves the underlying error details, and suggests a next
+step. For example:
+
+```text
+Request failed: The request to Anthropic received HTTP 503 (Service Unavailable).
+Details: AI_APICallError (HTTP 503): Service Unavailable
+Next: Check https://status.claude.com and your network/proxy before trying again.
+```
+
+Authentication errors point to the relevant API key; missing models, rate limits,
+DNS failures, and timeouts have separate guidance. Redis session errors identify
+the USER or ASSISTANT event, and tool errors identify the failing tool. Unknown
+SDK/application errors are reported without attributing them to a service.
+Configured API keys are redacted; diagnostics are limited in length and omit
+SDK request/response objects, headers, and stacks. Failures are not retried
+automatically; check saved session history before resubmitting a failed turn.
 
 ## Verify without credentials
 

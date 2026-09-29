@@ -16,31 +16,41 @@ Before that release, [build and install a local tarball](#development). Provisio
 
 ## Quick start
 
-This example uses Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible model providers work with the same toolset.
+These examples use Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible model providers work with the same toolset.
+
+### Agent-managed session recording (no hooks)
+
+Give the agent the memory tools and let it decide when to record session events
+or save long-term facts. This example has no application-managed session logging.
 
 ```ts
 import { anthropic } from '@ai-sdk/anthropic';
 import { ToolLoopAgent, isStepCount } from 'ai';
-import { RedisAgentMemory, instructions } from 'ai-sdk-redis-agent-memory';
+import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
 
 // Your application supplies these from authenticated user/conversation state.
 const userId = 'user-123';
 const sessionId = 'conversation-456';
 const agentId = 'assistant-1';
 
+const tools = createRedisAgentMemoryTools(
+  // Defaults to AGENT_MEMORY_URL or https://gcp-us-east4.memory.redis.io.
+  process.env.AGENT_MEMORY_URL,
+  process.env.AGENT_MEMORY_STORE_ID,
+  process.env.AGENT_MEMORY_API_KEY,
+  { userId, sessionId },
+);
+
 const agent = new ToolLoopAgent({
   model: anthropic('claude-sonnet-4-5'),
-  tools: new RedisAgentMemory(
-    // Defaults to AGENT_MEMORY_URL or https://gcp-us-east4.memory.redis.io.
-    process.env.AGENT_MEMORY_URL,
-    process.env.AGENT_MEMORY_STORE_ID,
-    process.env.AGENT_MEMORY_API_KEY,
-    { userId, sessionId },
-  ),
+  tools,
   instructions: `${instructions}
 Current user and memory owner: ${userId}
 Current session: ${sessionId}
-Current assistant actor: ${agentId}`,
+Current assistant actor: ${agentId}
+The application does not log session events. Decide when to record this conversation
+using start_session or add_session_event. Start a new session with the user's
+message, then use add_session_event for subsequent USER and ASSISTANT events.`,
   stopWhen: isStepCount(8),
 });
 
@@ -50,7 +60,71 @@ const result = await agent.generate({
 console.log(result.finalStep.text);
 ```
 
-The model decides when to use a memory tool. Instructions guide that decision; they do not force retrieval or storage on every turn. If your application requires every message to be recorded, call the official SDK from your request handler and tell the agent not to duplicate those events. This toolset does not automatically load conversation history into the model context.
+Instructions guide the model's tool choices; they do not guarantee that every
+message or the final reply is stored. Saving a long-term fact with
+`create_memories` is separate from recording conversation events. This toolset
+does not automatically load conversation history into the model context.
+
+### Automatic session recording with hooks
+
+Use the same factory with `onStart` and `onEnd` to record the current user message
+and the final assistant reply independently of the model's tool choices. Keep
+session-write tools out of `activeTools` to avoid duplicate recording; the agent
+can still decide when to save and retrieve long-term memories.
+
+```ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { ToolLoopAgent, isStepCount } from 'ai';
+import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
+
+// Your application supplies these from authenticated user/conversation state.
+const userId = 'user-123';
+const sessionId = 'conversation-456';
+const agentId = 'assistant-1';
+
+const tools = createRedisAgentMemoryTools(
+  process.env.AGENT_MEMORY_URL,
+  process.env.AGENT_MEMORY_STORE_ID,
+  process.env.AGENT_MEMORY_API_KEY,
+  { userId, sessionId },
+);
+
+const agent = new ToolLoopAgent({
+  model: anthropic('claude-sonnet-4-5'),
+  tools,
+  activeTools: [
+    'get_memory_context', 'get_session_memory',
+    'create_memories', 'search_memories', 'update_memory',
+  ],
+  instructions: `${instructions}
+Current user and memory owner: ${userId}
+Current session: ${sessionId}
+Current assistant actor: ${agentId}
+The application records user input before generation and the final reply afterward.
+Do not write session events. Use get_session_memory to read saved messages.`,
+  stopWhen: isStepCount(8),
+  onStart: tools.createSessionEventHook({
+    role: 'USER',
+    actorId: userId,
+    onError: error => console.error('USER session save failed:', error.message),
+  }),
+  onEnd: tools.createSessionEventHook({
+    role: 'ASSISTANT',
+    actorId: agentId,
+    onError: error => console.error('ASSISTANT session save failed:', error.message),
+  }),
+});
+
+const result = await agent.generate({
+  prompt: 'Remember that I prefer TypeScript examples.',
+});
+console.log(result.finalStep.text);
+```
+
+The USER write is awaited before the model starts, and the ASSISTANT hook records
+nonempty final text in `onEnd`. The hooks run independently and report save
+failures through `onError`. See [Recording session events](#recording-session-events)
+for input requirements, observers, and failure behavior.
 
 ## Runnable demo
 
@@ -61,7 +135,7 @@ instructions are in the demo README. The demo is excluded from npm releases.
 
 ## Combining tools
 
-The class implements the AI SDK `ToolSet` string index signature. Its own enumerable properties are exclusively tools; API credentials and the SDK client stay in closures. `createRedisAgentMemoryTools(serverUrl?, storeId?, apiKey?, scope?, options?)` returns an equivalent plain tool map, useful for spreading or selectively including tools:
+`createRedisAgentMemoryTools(serverUrl?, storeId?, apiKey?, scope?, options?)` returns a tool map compatible with the AI SDK `ToolSet`, useful for spreading or selectively including tools. Its own enumerable properties are exclusively tools; API credentials and the SDK client stay in closures.
 
 ```ts
 import { createRedisAgentMemoryTools } from 'ai-sdk-redis-agent-memory';
@@ -71,14 +145,108 @@ const tools = { search_memories: memory.search_memories!, get_memory: memory.get
 
 This is a server-side package. Never put the Iris API key in a frontend bundle.
 
+## Reusing memory across conversations
+
+Call `withContext(scope)` on the factory result to get independent tools for a
+conversation. Each result shares the original SDK client and configuration,
+and captures a copy of its scope.
+
+```ts
+const memory = createRedisAgentMemoryTools(serverUrl, storeId, apiKey, {
+  userId: 'user-42',
+});
+
+const agent = new ToolLoopAgent({
+  model,
+  tools: memory.withContext({ sessionId: 'conversation-1' }),
+});
+const anotherAgent = new ToolLoopAgent({
+  model,
+  tools: memory.withContext({ sessionId: 'conversation-2' }),
+});
+```
+
+`withContext` leaves the original toolset and previously derived toolsets
+unchanged, so conversations can run concurrently. It accepts the same `userId`,
+`sessionId`, `namespaceId`, and legacy `namespace` fields as construction-time
+scope. Defined values fill missing fields; omitted or `undefined` fields retain
+their existing values. Conflicting fixed values are rejected, including values
+bound by an earlier `withContext` call. To serve multiple users, leave `userId`
+unset on the base toolset and provide it on each derived toolset. For multiple
+conversations, leave `sessionId` unset on the base.
+
+Scope remains optional when creating the toolset. A toolset with no scope
+retains its existing unscoped behavior; omitting scope does not defer execution
+until `withContext` is called. The helper is non-enumerable, so it is never
+advertised to the model as a tool and is omitted when spreading the toolset.
+
+## Recording session events
+
+Call `createSessionEventHook(options)` on a scoped toolset and pass the returned
+callback to the matching lifecycle hook: `role: 'USER'` goes on `onStart`, and
+`role: 'ASSISTANT'` goes on `onEnd`. Each callback records one event using the
+same ownership and namespace checks as the session tools. The
+[hook example above](#automatic-session-recording-with-hooks) shows both callbacks
+on a toolset created by the factory.
+
+`userId` and `sessionId` must be fixed in the toolset's scope before creating the
+hook, through the factory or `withContext`. The hook captures that scope.
+Supply `actorId` for each hook; the USER actor must equal the scoped
+`userId`, and the ASSISTANT actor identifies your agent. Like `withContext`, the
+helper is non-enumerable, so it is not advertised to the model or copied by
+object spread.
+
+The USER hook reads the `onStart` input messages. The final message must have
+role `user`, with either a content string or text parts. Text parts remain
+separate event content items; images, files, and other non-text parts are
+ignored. A user message without nonempty text fails validation. The ASSISTANT
+hook reads `finalStep.text` and skips an empty reply. Each hook validates its
+event before writing. No `include.requestMessages` setting is needed. Earlier
+history, intermediate steps, tool calls, and tool results are not recorded.
+
+The USER write is awaited before the model starts, so memory tools can read
+that message during generation. It remains saved if generation later fails.
+The ASSISTANT event is recorded only when the SDK invokes `onEnd` with nonempty
+final text.
+
+Hook options are:
+
+| Option | Behavior |
+| --- | --- |
+| `role` | Required: `'USER'` for `onStart`, or `'ASSISTANT'` for `onEnd` |
+| `actorId` | Required author ID; must match scoped `userId` for USER events |
+| `onError(error, context)` | Required handler for validation or write failures; receives a sanitized `RedisAgentMemoryToolError` |
+| `onEventStart(info)` | Optional observer called before each append attempt |
+| `onEventSaved(info)` | Optional observer called after each confirmed append |
+
+Observer `info` has type `SessionHookEvent` and contains `sessionId`, `role`, and
+`actorId`. Error `context` contains those same fields plus `userId` and `phase`
+(`'validation'` or `'write'`).
+Callbacks may be asynchronous and are awaited; their exceptions, including
+exceptions from `onError`, are ignored. Observer errors do not interrupt
+recording. Hook writes do not trigger the AI SDK's `onToolExecutionStart` or
+`onToolExecutionEnd` callbacks; use the event observers for session logging.
+
+The two hooks run independently. A USER save failure does not stop generation
+or prevent the ASSISTANT hook from running. A failed write may have committed
+without confirmation, so the assistant event may still be appended afterward.
+Ownership checks still prevent an ASSISTANT event from starting a new
+user-owned session. Writes are not atomic, retried, or deduplicated; verify
+uncertain outcomes before retrying and register each hook only once per
+generation. AI SDK ignores lifecycle callback exceptions, so report failures
+through `onError`. To require persistence before proceeding with generation or
+returning a reply, use the official SDK in your application workflow.
+
 ## Configuration
 
-The factory and class constructor accept the same positional arguments:
+The factory accepts these positional arguments:
 
 ```ts
 createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options);
-new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options);
 ```
+
+The `RedisAgentMemory` class constructor remains available with the same arguments
+and helpers as the factory result.
 
 Omit an argument or pass `undefined` to use its default. The API key and store ID must be supplied as arguments or through the environment.
 
@@ -109,11 +277,11 @@ The `scope` argument accepts:
 
 For example, `createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, { allowDeletes: true })` enables deletion tools. Namespace deletion requires both switches to be `true`.
 
-Configuration is copied at construction. Create a scoped toolset for each authenticated request/conversation; do not mutate a shared instance's scope. AI SDK `abortSignal` is forwarded to every Iris request. SDK defaults disable automatic retries, avoiding duplicate session appends after uncertain network outcomes.
+Configuration is copied at construction. Create a scoped toolset for each authenticated request/conversation; do not mutate a shared instance's scope. During tool execution, the AI SDK `abortSignal` is forwarded to Iris requests. The session event hook has no generation abort signal and uses the configured HTTP timeout. SDK defaults disable automatic retries, avoiding duplicate session appends after uncertain network outcomes.
 
 ## Tool reference
 
-All parameter names are camelCase. IDs remain visible to the model; fixed constructor scopes cannot be overridden. The three deletion tools below are exposed only when `options.allowDeletes` is `true`.
+All parameter names are camelCase. IDs remain visible to the model; fixed scopes cannot be overridden. The three deletion tools below are exposed only when `options.allowDeletes` is `true`.
 
 | Tool | Parameters and result |
 | --- | --- |
@@ -173,7 +341,7 @@ Attribute filters accept exactly one of `{string}`, `{number}`, `{boolean}`, or 
 
 ## Identity and scope behavior
 
-`scope.userId` identifies the application user. The tools use that identity in role-specific fields: `ownerId` for the user's memories, sessions, and PERSONAL namespaces, and `actorId` for their USER events. Memory creation supplies `ownerId` automatically from `scope.userId`; session events still require an explicit `actorId`.
+`scope.userId` identifies the application user. The tools use that identity in role-specific fields: `ownerId` for the user's memories, sessions, and PERSONAL namespaces, and `actorId` for their USER events. Memory creation supplies `ownerId` automatically from `scope.userId`; session tools and `createSessionEventHook` require an explicit `actorId`.
 
 Append `instructions` to your agent's instructions and supply current user/agent/session IDs in trusted application context. A USER event uses the human user's ID as `actorId`; an ASSISTANT event uses the agent's ID. The first event establishes immutable session ownership, so initialize user-owned sessions with the user's message. With `scope.userId` set, the wrapper requires a new session to start with a USER event whose `actorId` matches that user ID.
 
