@@ -1,0 +1,124 @@
+# Iris memory model wrapper plan
+
+Status: interview decisions captured; consolidated scope awaiting confirmation. No implementation is authorized by this document alone.
+
+## Purpose
+
+Add an independent AI SDK model integration that restores Iris session context and retrieves relevant long-term memories automatically before inference. The default experience is to pick up where the conversation left off. Applications pass the wrapped model to ordinary AI SDK APIs; the model does not have to choose a memory tool. Iris-managed mode records session events by default to feed both future session restoration and Iris background extraction for cross-session recall; applications can explicitly disable recording.
+
+Existing memory tools remain supported and unchanged. The wrapper must work without constructing a toolset, executing a tool, or installing application lifecycle hooks.
+
+## Integration boundary
+
+- Accept an already-configured underlying language model rather than resolving provider/model names.
+- Use AI SDK model middleware internally, targeting the repository's AI SDK 7 contract. Support `generateText`, `streamText`, and tool-loop agents.
+- Publish an independent entry point in the existing package. Exact exported names and subpath remain implementation naming choices, not additional features.
+- Bind immutable authenticated `userId`, store, and scope when creating a wrapper. Require `sessionId` in the default Iris-managed history mode or whenever recording is enabled. Never infer identity or widen scope from prompt content.
+- Create a fresh wrapper for each top-level generation or agent request. Reuse that wrapper across the request's steps and retries, but not across independent or concurrent requests. Underlying models and Iris clients may be shared.
+- Require the application to serialize independent requests within a session: one active application request per session. Different sessions can run concurrently. Do not introduce distributed locking or promise cross-request ordering the wrapper cannot enforce.
+- Read personal long-term memories only in v1, across sessions within the configured scope. Restore working context only from the specified session, with ownership and scope validation.
+
+AI SDK documents RAG through `transformParams`, while provider factories can compose wrapped models. Middleware observes individual model calls, not complete application turns. [Middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), [provider management](https://ai-sdk.dev/docs/ai-sdk-core/provider-management), [tool loops](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling).
+
+## Retrieval and context
+
+Two explicit history modes avoid silently merging independently maintained histories:
+
+- **Iris-managed history is the default.** At the beginning of a request, the caller supplies current application instructions and the new user message. The wrapper restores prior session context, then preserves current-request model/tool-loop messages as the request progresses. Caller-supplied historical conversation must not be silently merged into this mode.
+- **Application-managed history is an opt-out from restoration.** The caller supplies the conversation; the wrapper only adds long-term recall by default. Recording remains opt-in in this mode. A session ID is optional here unless recording is enabled.
+
+The primary usage example uses default Iris-managed restoration and recording. Its documentation must clearly state that conversational text is sent to Iris. An explicit recording opt-out disables all user and assistant writes without disabling reads; in that configuration, future restoration depends on history populated separately.
+
+1. Use the latest user text as the search query, unless the application supplies an explicit override. Do not make an additional LLM call to formulate it.
+2. Retrieve session context and long-term memories concurrently, with at most one attempt at each read per wrapper/request and a shared one-second deadline. Reuse that bounded snapshot across steps and retries, including empty or failed results. Do not cache across requests.
+3. Skip long-term search when neither user text nor an explicit query is available. Session restoration remains independent of the search query.
+4. Enforce owner and configured namespace restrictions independently of model-generated content. A session identifier must not accidentally restrict long-term recall to that session.
+5. Restore the available summary and newest retained conversation messages within the session-context budget, preserving their order. Fetch before writing the new user event so it is not restored twice. Retain the current user message and current-request tool-loop messages exactly once, without duplicating restored context on later steps.
+6. Inject clearly delimited reference context, identifying memories and derived summaries as potentially stale and untrusted rather than instructions. Preserve current application instructions and original current-request messages. Restored historical content must not override current application instructions.
+7. Never record restored or injected context back into Iris. Prompt labeling mitigates but cannot eliminate prompt-injection risk.
+
+Configurable starting defaults:
+
+| Setting | Default |
+| --- | --- |
+| Retrieved memories | 5 |
+| Total injected long-term memory section | 8,000 characters |
+| Restored session context | 24,000 characters |
+| Shared deadline for concurrent session and long-term reads | 1 second |
+| Deadline per recording operation | 1 second |
+
+Prefer the available summary and newest conversation messages when selecting session context; report omitted history through diagnostics. Never truncate the caller's current input. These are initial product limits, not measured performance guarantees. A character budget is not a token-count guarantee.
+
+Iris returns an optional summary and retained events; restoration is not a promise of a complete verbatim transcript. The published SDK exposes no pagination or server-side history limit, so the session budget limits prompt injection, not the fetched response size. Its generic not-found response does not distinguish expired, deleted, and never-created sessions. Treat these as an unavailable session: start with the current message and any available long-term recall, and emit a diagnostic without inventing the cause. [Version-pinned SDK artifact](https://registry.npmjs.org/@redis-iris/agent-memory/-/agent-memory-0.3.1.tgz).
+
+## Recording defaults and boundaries
+
+Recording defaults to enabled in Iris-managed mode and disabled in application-managed mode, with an explicit override independent of reads. This supersedes the interview's earlier blanket opt-in decision so default session continuity works without a separate writer. Application consent and pre-storage data handling remain the application's responsibility.
+
+Recording covers the latest user input and each successful assistant response containing text, including intermediate assistant text and the final answer when successfully completed. There is no separate final-answer-only toggle in v1: a standalone model wrapper cannot reliably identify the end of every application run. Intermediate text may be restored later without its associated tool payloads, which are excluded from recording.
+
+- After the restoration read has completed or reached its deadline, attempt to record the latest user text once per wrapper/request, before generating assistant events. Do not backfill supplied or restored history.
+- After each successful model step, record newly generated assistant text, including intermediate assistant text. Empty assistant text produces no event.
+- Exclude system instructions, injected memories, reasoning, tool arguments/results, and binary content. Text parts of otherwise multimodal messages may participate; original model inputs pass through unchanged.
+- For streams, pass nonterminal chunks through without buffering their delivery. Accumulate only the assistant text needed for recording. Persist it after raw provider finish plus normal source close, with bounded persistence before signaling terminal completion. Failed or cancelled raw streams must not produce an assistant event; downstream consumption is not observable and is not a recording condition.
+- Use the authenticated user principal as the USER event actor. If its write is not confirmed successful, suppress all further recording for that request and report a diagnostic. Do not risk establishing a new session with an assistant-owned first event.
+- Do not retry session writes automatically. Recording is best-effort, not exactly-once. Application retries with a fresh wrapper can still create duplicate events; ambiguous timeouts can mean a write succeeded remotely.
+- Do not combine automatic recording with existing recording hooks for the same interactions. Tools may coexist, but applications must avoid duplicate recording responsibilities.
+
+Iris automatically extracts long-term memories from session events asynchronously; a just-recorded fact may not be searchable immediately. Extraction exclusions do not redact raw session events, so consent and pre-storage data minimization remain application responsibilities. [Iris quickstart](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/typescript-sdk-quickstart/), [developer guide](https://redis.io/docs/latest/develop/ai/context-engine/agent-memory/developer-guide/).
+
+The published Iris SDK 0.3.1 exposes no documented session-write idempotency key or caller event ID; its session schema assigns ownership from the first event's actor. A durable client outbox alone cannot guarantee exactly-once remote effects after ambiguous success. [Version-pinned SDK artifact](https://registry.npmjs.org/@redis-iris/agent-memory/-/agent-memory-0.3.1.tgz).
+
+## Errors and diagnostics
+
+- Default retrieval behavior is fail-open: bounded operational failure in session restoration or long-term search does not prevent model generation. Use any successful read result independently; never claim that missing history was restored. Empty long-term results and unavailable sessions are normal outcomes, not operational errors.
+- Optional strict mode fails before generation when either required read fails operationally. It does not reject an ordinary absent session or turn recording failures into generation failures.
+- Invalid configuration and missing required identity always throw. Never bypass scope enforcement as a fallback.
+- Preserve underlying model failures and cancellation behavior; memory failure handling must not mask them.
+- Offer an optional structured diagnostic callback with operation, outcome, duration, counts, truncation, and sanitized errors. Exclude prompt and memory text and credentials. No default console logging.
+- Diagnostic callback failures must not break generation. No untracked fire-and-forget memory writes.
+
+## Optional memory provenance
+
+Offer explicit opt-in provenance for the long-term memories actually included in model context, through AI SDK response/stream metadata. Keep existing underlying provider metadata intact. The exact public field name is an implementation naming choice.
+
+- Disable provenance by default. When enabled, expose memory IDs and an allowlisted set of safe descriptive metadata, not raw memory text, prompts, credentials, or arbitrary stored metadata.
+- Report only records retained after context-budget selection, not every retrieved candidate. Apply the same scope boundaries as retrieval and do not perform extra memory reads to populate provenance.
+- Preserve provenance availability for both ordinary generation and streaming. Reused request snapshots should report a consistent set of included memories across steps.
+- Provenance means the memory was supplied as context, not proof that the model relied on it or that the memory is correct. Keep operational diagnostics content-free regardless of this option.
+
+This adopts Mem0's useful programmatic source-attribution pattern while making exposure opt-in and limiting the returned data. [Mem0 source attribution](https://docs.mem0.ai/integrations/vercel-ai-sdk).
+
+## Implementation sequence
+
+1. Add regression coverage for existing owner/namespace isolation and recording behavior before extracting any shared internals.
+2. Establish the smallest tool-independent client, validation, and scoped-operation seam needed by the wrapper. Reuse existing patterns rather than execute tool handlers or introduce a new framework. Preserve existing public APIs; add no dependencies without a separate decision.
+3. Add scoped request wrappers, default session restoration, application-managed opt-out, and bounded context injection from concurrent reads, covering ordinary generation and streaming.
+4. Add per-request user-write state and per-successful-step assistant recording, with retry, cancellation, and ownership safeguards.
+5. Add optional memory provenance, the independent package export, examples, API documentation, and package-consumer checks.
+6. Run focused tests followed by `npm run check`, which performs typechecking, tests, build, and packed-package consumer validation. The repository currently has no standalone lint script; do not report lint as run.
+
+## Acceptance evidence
+
+- A model without memory tools receives scoped Iris context before inference in both generate and stream paths.
+- Default Iris-managed mode resumes the same session on a fresh wrapper using available summary and recent events. Application-managed mode makes no session-history read. Both modes validate required identity and preserve current application instructions.
+- Restoration precedes the user-event write. Restored history, the new user message, and later tool-loop messages are each included once; incompatible supplied history is not silently merged.
+- Cross-user and cross-namespace isolation survives query overrides, failures, and simultaneous independently scoped wrappers.
+- Each wrapper performs at most one session read and one long-term search, including tool-loop steps and provider retries; prompt inputs are not mutated and injected context is not duplicated.
+- Separate context budgets, a shared read deadline, query overrides, no-text input, absent/expired sessions, summaries, empty results, partial read failure, strict mode, and diagnostic sanitization have focused tests. The caller's current input is never truncated by memory budgeting.
+- User recording has at most one attempt per wrapper. A failed or ambiguous user write suppresses assistant writes. Fresh-wrapper retries are documented as potentially duplicating events.
+- Iris-managed mode records by default; its recording opt-out suppresses all user and assistant writes while preserving reads. Application-managed mode records only when explicitly enabled.
+- Each successful assistant step records only generated text. Tests cover text-only, mixed text/tool responses, tool-only responses, reasoning parts, stream errors, cancellation, and raw completion without downstream consumption.
+- Streaming preserves provider chunks and non-text events while awaiting only bounded end-of-stream persistence.
+- Provenance is absent by default. Opt-in generate and stream tests expose only included, in-scope memory IDs and allowlisted metadata, preserve existing provider metadata, and exclude raw text and arbitrary stored metadata. Provenance requires no additional memory calls.
+- Existing tool and lifecycle-hook tests still pass. The new entry point works in a packed-package consumer without tool or hook setup.
+- No live Iris or inference calls are required for automated tests; any later live validation requires its own credentials and authorization.
+- Usage documentation and examples require application-owned per-session serialization and clearly disclose default recording in Iris-managed mode, the recording opt-out, and inclusion of intermediate assistant text. No distributed-lock, final-answer-only, or complete-transcript guarantee is claimed.
+
+## Deferred scope
+
+See the [Iris memory roadmap](iris-memory-roadmap.md). Deferred features are captured for future planning, not silently included in v1.
+
+## Prior art
+
+Vercel's Mem0 example supports the provider-like user experience without model-selected memory tools. It is an ergonomic precedent, not evidence of exactly-once recording or complete-run lifecycle visibility. AI SDK's caching middleware illustrates separate stream-completion handling. [Memory integrations](https://ai-sdk.dev/docs/agents/memory), [caching middleware](https://ai-sdk.dev/docs/advanced/caching).

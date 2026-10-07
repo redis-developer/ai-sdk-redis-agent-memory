@@ -1,4 +1,4 @@
-import { AgentMemory } from '@redis-iris/agent-memory';
+import type { AgentMemory } from '@redis-iris/agent-memory';
 import type { LongTermMemoryFilter } from '@redis-iris/agent-memory/models';
 import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
@@ -6,22 +6,20 @@ import * as s from './schemas.js';
 import { createNamespaceTools } from './namespaces.js';
 import { RedisAgentMemoryToolError, sanitizeMemoryError } from './errors.js';
 import { createSessionEventHook, type SessionEventHook, type SessionEventHookOptions } from './session-event-hook.js';
+import {
+  copyMemoryScope,
+  createScopedMemory,
+  extendMemoryScope,
+  resolveAgentMemoryClient,
+  type RedisAgentMemoryScope,
+} from './scoped-memory.js';
 export { instructions } from './instructions.js';
 export { RedisAgentMemoryToolError } from './errors.js';
 export type {
   SessionEventHook, SessionEventHookInput, SessionEventHookOptions,
   SessionHookEvent, SessionEventHookErrorContext,
 } from './session-event-hook.js';
-
-export interface RedisAgentMemoryScope {
-  /** Stable application user ID. Used as the memory owner and as the actor for USER events. */
-  userId?: string;
-  /** Locks session operations and associates new memories; recall still spans this user's sessions. */
-  sessionId?: string;
-  /** Deprecated label; prefer namespaceId for resource-backed namespaces. */
-  namespace?: string;
-  namespaceId?: string;
-}
+export type { RedisAgentMemoryScope } from './scoped-memory.js';
 export interface RedisAgentMemoryOptions {
   /** Expose deletion tools. Defaults to false. */
   allowDeletes?: boolean;
@@ -39,32 +37,6 @@ export type RedisAgentMemoryTools = ToolSet & {
 };
 
 function fail(message: string): never { throw new RedisAgentMemoryToolError('INVALID_SCOPE', message); }
-function status(error: unknown): number | undefined {
-  return typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
-    ? error.statusCode : undefined;
-}
-
-function copyScope(scope: RedisAgentMemoryScope, options: RedisAgentMemoryOptions): Readonly<RedisAgentMemoryScope> {
-  scope = Object.freeze({ ...scope });
-  if (scope.userId !== undefined) s.ownerId.parse(scope.userId);
-  if (scope.sessionId !== undefined) s.sessionId.parse(scope.sessionId);
-  if (scope.namespaceId !== undefined) s.id.parse(scope.namespaceId);
-  if (scope.namespace !== undefined && !scope.namespace.trim()) throw new Error('scope.namespace must not be empty.');
-  if (scope.namespace !== undefined && scope.namespaceId !== undefined) throw new Error('Choose scope.namespace or scope.namespaceId.');
-  if (options.namespaceTools && scope.namespace !== undefined) throw new Error('Namespace resource tools cannot use a legacy namespace scope.');
-  return scope;
-}
-
-function extendScope(scope: RedisAgentMemoryScope, context: RedisAgentMemoryScope): RedisAgentMemoryScope {
-  const extended = { ...scope };
-  for (const name of ['userId', 'sessionId', 'namespace', 'namespaceId'] as const) {
-    const value = context[name];
-    if (value === undefined) continue;
-    if (scope[name] !== undefined && scope[name] !== value) fail(`Cannot override ${name} scope.`);
-    extended[name] = value;
-  }
-  return extended;
-}
 
 /**
  * Build ordinary AI SDK tools backed by the official Redis SDK. All credentials stay in closures.
@@ -81,20 +53,9 @@ export function createRedisAgentMemoryTools(
   scope: RedisAgentMemoryScope = {},
   options: RedisAgentMemoryOptions = {},
 ): RedisAgentMemoryTools {
-  const env = typeof process === 'undefined' ? {} : process.env;
-  const key = apiKey ?? env.AGENT_MEMORY_API_KEY;
-  const resolvedStoreId = storeId ?? env.AGENT_MEMORY_STORE_ID;
-  if (!key?.trim()) throw new Error('Set AGENT_MEMORY_API_KEY or pass an Iris API key.');
-  if (!resolvedStoreId?.trim()) throw new Error('Set AGENT_MEMORY_STORE_ID or pass storeId.');
-  const serverURL = serverUrl ?? env.AGENT_MEMORY_URL ?? 'https://gcp-us-east4.memory.redis.io';
-  const url = new URL(serverURL);
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error('serverUrl must be an HTTP(S) URL without credentials, query, or fragment.');
-  }
   options = Object.freeze({ ...options });
-  scope = copyScope(scope, options);
-  if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error('timeoutMs must be positive.');
-  const client = new AgentMemory({ apiKey: key, storeId: resolvedStoreId, serverURL, timeoutMs: options.timeoutMs ?? 30_000 });
+  scope = copyMemoryScope(scope, options);
+  const client = resolveAgentMemoryClient(serverUrl, storeId, apiKey, options.timeoutMs ?? 30_000);
   return buildTools(client, scope, options);
 }
 
@@ -104,78 +65,19 @@ function buildTools(
   options: Readonly<RedisAgentMemoryOptions>,
 ): RedisAgentMemoryTools {
   const deletes = options.allowDeletes ?? false;
-  type Placement = { namespace?: string; namespaceRef?: { namespaceId: string } };
-  const checkPlacement = (value: Placement) => {
-    if (value.namespace !== undefined && value.namespaceRef !== undefined) fail('Supply namespace or namespaceRef, never both.');
-    if (scope.namespace !== undefined && value.namespace !== scope.namespace) fail('Resource is outside the configured namespace.');
-    if (scope.namespaceId !== undefined && value.namespaceRef?.namespaceId !== scope.namespaceId) fail('Resource is outside the configured namespace resource.');
-  };
-  const place = <T extends Placement>(input: T): T => {
-    const value = { ...input };
-    if (value.namespace !== undefined && value.namespaceRef !== undefined) fail('Supply namespace or namespaceRef, never both.');
-    if (scope.namespace !== undefined) {
-      if (value.namespaceRef || (value.namespace !== undefined && value.namespace !== scope.namespace)) fail('Cannot override namespace scope.');
-      value.namespace = scope.namespace;
-    }
-    if (scope.namespaceId !== undefined) {
-      if (value.namespace !== undefined || (value.namespaceRef && value.namespaceRef.namespaceId !== scope.namespaceId)) fail('Cannot override namespace scope.');
-      value.namespaceRef = { namespaceId: scope.namespaceId };
-    }
-    return value;
-  };
-  const resolveSession = (value?: string) => {
-    if (scope.sessionId && value && value !== scope.sessionId) fail('Cannot override session scope.');
-    const resolved = value ?? scope.sessionId;
-    if (!resolved) fail('Supply sessionId or configure scope.sessionId.');
-    return resolved;
-  };
-  const resolveOwner = (value?: string) => {
-    if (scope.userId && value && value !== scope.userId) fail('Cannot override user scope.');
-    const resolved = value ?? scope.userId;
-    if (!resolved) fail('Supply ownerId or configure scope.userId.');
-    return resolved;
-  };
-  const assertSession = async (sessionId: string, signal?: AbortSignal) => {
-    resolveSession(sessionId);
-    const session = await client.getSessionMemory(sessionId, false, { signal });
-    if (scope.userId && session.ownerId !== scope.userId) fail('Session is outside the configured user scope.');
-    checkPlacement(session);
-    return session;
-  };
-  const assertMemory = async (id: string, signal?: AbortSignal) => {
-    const memory = await client.getLongTermMemory(id, { signal });
-    if (scope.userId && memory.ownerId !== scope.userId) fail('Memory is outside the configured user scope.');
-    checkPlacement(memory);
-    return memory;
-  };
-  const hasResourceScope = Boolean(scope.userId || scope.namespace !== undefined || scope.namespaceId);
-  const assertPlacementOwner = async (value: Placement, signal?: AbortSignal) => {
-    if (!scope.userId || !value.namespaceRef) return;
-    const { namespace } = await client.getNamespace(value.namespaceRef.namespaceId, { signal });
-    const root = namespace.rootId === namespace.namespaceId ? namespace
-      : (await client.getNamespace(namespace.rootId, { signal })).namespace;
-    if (root.scope !== 'PERSONAL' || root.ownerId !== scope.userId) fail('Namespace placement is outside the configured user’s personal namespaces.');
-  };
-  const append = async (input: z.infer<typeof s.event>, signal?: AbortSignal, start = false) => {
-    const placed = place(input);
-    const sessionId = input.sessionId ?? scope.sessionId;
-    if (sessionId) {
-      resolveSession(sessionId);
-      if (hasResourceScope || start) {
-        try {
-          await assertSession(sessionId, signal);
-          if (start) fail('This session already exists; use add_session_event.');
-        } catch (error) {
-          if (status(error) !== 404) throw error;
-          if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) fail('A new session must start with a USER event whose actorId is the configured userId.');
-        }
-      }
-    } else if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) {
-      fail('A new session must start with a USER event whose actorId is the configured userId.');
-    }
-    await assertPlacementOwner(placed, signal);
-    return client.addSessionEvent({ ...placed, sessionId, createdAt: input.createdAt ? new Date(input.createdAt) : new Date() }, { signal });
-  };
+  const scoped = createScopedMemory(client, scope);
+  const {
+    place, resolveSession, resolveOwner, checkPlacement, hasResourceScope,
+  } = scoped;
+  const assertSession = (sessionId: string, signal?: AbortSignal) => scoped.assertSession(sessionId, { signal });
+  const assertMemory = (id: string, signal?: AbortSignal) => scoped.assertMemory(id, { signal });
+  const assertPlacementOwner = (
+    value: { namespace?: string; namespaceRef?: { namespaceId: string } },
+    signal?: AbortSignal,
+  ) => scoped.assertPlacementOwner(value, { signal });
+  const append = (input: z.infer<typeof s.event>, signal?: AbortSignal, start = false) => (
+    scoped.appendSessionEvent(input, { signal, start })
+  );
   const sessionInput = z.object({ sessionId: s.sessionId.optional() });
   const eventInput = sessionInput.extend({ eventId: s.id });
   const tools: ToolSet = {
@@ -262,26 +164,7 @@ function buildTools(
       execute: async (input, { abortSignal }) => {
         const filter: LongTermMemoryFilter = { ...input.filter, createdAt: input.filter?.createdAt
           ? Object.fromEntries(Object.entries(input.filter.createdAt).filter(([,v]) => v !== undefined).map(([k,v]) => [k, new Date(v!)])) : undefined };
-        if (filter.namespace && filter.namespaceRef) fail('Supply namespace or namespaceRef, never both.');
-        if (filter.unnamespaced !== undefined && (filter.namespace || filter.namespaceRef)) fail('unnamespaced cannot be combined with namespace selectors.');
-        if (hasResourceScope && input.filterOp === 'any') fail('Scoped searches require filterOp all to preserve isolation.');
-        const fixed = (name: 'ownerId' | 'namespace' | 'namespaceRef', value: string) => {
-          const existing = filter[name];
-          if (existing && (existing.eq !== value || Object.values(existing).filter(v => v !== undefined).length !== 1)) fail(`Cannot override ${name} scope.`);
-          filter[name] = { eq: value };
-        };
-        if (scope.userId) fixed('ownerId', scope.userId);
-        if (scope.namespace !== undefined || scope.namespaceId) {
-          if (filter.unnamespaced !== undefined) fail('Cannot search unnamespaced records within a namespace scope.');
-          if (scope.namespace !== undefined) {
-            if (filter.namespaceRef) fail('Cannot override namespace scope.');
-            fixed('namespace', scope.namespace);
-          } else {
-            if (filter.namespace) fail('Cannot override namespace scope.');
-            fixed('namespaceRef', scope.namespaceId!);
-          }
-        }
-        return client.searchLongTermMemory({ ...input, filter, filterOp: hasResourceScope ? 'all' : input.filterOp }, { signal: abortSignal });
+        return scoped.searchLongTermMemory({ ...input, filter }, { signal: abortSignal });
       },
     }),
     update_memory: tool({
@@ -343,7 +226,11 @@ function buildTools(
   // Keep application helpers out of AI SDK tool enumeration and object spreads.
   Object.defineProperties(tools, {
     withContext: {
-      value: (context: RedisAgentMemoryScope) => buildTools(client, copyScope(extendScope(scope, context), options), options),
+      value: (context: RedisAgentMemoryScope) => buildTools(
+        client,
+        copyMemoryScope(extendMemoryScope(scope, context), options),
+        options,
+      ),
     },
     createSessionEventHook: {
       value: (hookOptions: SessionEventHookOptions) => createSessionEventHook(scope, append, hookOptions),

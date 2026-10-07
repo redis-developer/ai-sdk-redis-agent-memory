@@ -1,6 +1,7 @@
 # Redis Agent Memory for Vercel's AI SDK
 
-This integration provides short-term and long-term memory tools to agents developed with Vercel's [AI SDK](https://ai-sdk.dev/).
+This integration provides an automatic memory model wrapper and optional short-term
+and long-term memory tools for agents developed with Vercel's [AI SDK](https://ai-sdk.dev/).
 
 ## Installation
 
@@ -16,7 +17,96 @@ Before that release, [build and install a local tarball](#development). Provisio
 
 ## Quick start
 
-These examples use Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible model providers work with the same toolset.
+These examples use Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible configured models work the same way.
+
+### Automatic context and recording (recommended)
+
+Wrap an already configured model from the independent `./provider` subpath. The
+wrapper restores the Iris session, recalls personal long-term memories, injects a
+bounded untrusted context block, and records the current user input plus every
+successful text-bearing raw assistant step. It does not expose memory tools to the
+model, so recall and session recording do not depend on a model deciding to call one.
+When context is nonempty, the wrapper prepends the fixed outer notice
+`IRIS MEMORY CONTEXT MAY BE STALE.\n`. Its 34 UTF-16 units are fixed framing
+outside the independently configured session and long-term-memory character budgets.
+
+```ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { generateText } from 'ai';
+import { createRedisAgentMemoryProvider } from 'ai-sdk-redis-agent-memory/provider';
+
+const memory = createRedisAgentMemoryProvider({
+  serverUrl: process.env.AGENT_MEMORY_URL,
+  storeId: process.env.AGENT_MEMORY_STORE_ID,
+  apiKey: process.env.AGENT_MEMORY_API_KEY,
+});
+
+// Derive these IDs from authenticated, application-owned state, not request input.
+const userId = 'user-123';
+const sessionId = 'conversation-456';
+
+// Create one wrapped model per application request. Do not reuse it for another request.
+const model = memory.wrap(anthropic('claude-sonnet-4-5'), {
+  scope: { userId, sessionId },
+  assistantId: 'assistant-1',
+});
+
+const result = await generateText({
+  model,
+  prompt: 'Remember that I prefer TypeScript examples.',
+});
+console.log(result.text);
+```
+
+The default `historyMode: 'iris'` owns conversation history: it restores the
+session and defaults `recording` to `true`, giving a fresh wrapper for the same
+session the ability to pick up where the previous request stopped. The current
+USER event is written once before inference; every successful raw model step with
+generated text is written afterward, including intermediate tool-loop steps, not
+only the final answer. Only text is restored and recorded; image-only input,
+reasoning, tool arguments/results, binary data, and system events are omitted.
+Iris may use recorded session activity for its configured
+background long-term-memory extraction. Consent, PII handling, retention, and
+extraction policy remain Iris/application configuration concerns; this package
+does not implement another extraction pipeline.
+
+Use application-managed mode when your application already supplies complete
+history. It does not restore session events and defaults recording off, but still
+recalls long-term memory:
+
+```ts
+const model = memory.wrap(anthropic('claude-sonnet-4-5'), {
+  scope: { userId, sessionId },
+  historyMode: 'application',
+  recording: false,
+});
+```
+
+Set `includeMemoryProvenance: true` to add a sanitized
+`providerMetadata.redisAgentMemory.memories` list for memories actually included
+in the prompt. Entries contain only `id`, `memoryType`, `createdAt`, and
+`updatedAt`. Provenance is off by default. If the base model already owns the
+`redisAgentMemory` metadata key, its metadata is preserved unchanged and wrapper
+provenance is omitted.
+
+The wrapper is best effort, not an exactly-once delivery system. Iris 0.3.1 has
+no conditional session creation or append idempotency key; a timed-out POST may
+have committed. Use collision-resistant session IDs bound to the authenticated
+user in application-owned state, and globally serialize requests by the exact
+session ID—even if callers claim different users. A postflight check can stop
+later inference or writes, but cannot undo an already accepted cross-principal
+USER event. Never combine automatic wrapper recording with session lifecycle
+hooks or model-callable session-write tools for the same request, or events can
+be duplicated.
+
+For streaming, recording follows raw provider completion: a finish part followed
+by normal source close. The wrapper holds the terminal finish briefly for the
+bounded save, but nonterminal parts pass through as produced. This does not prove
+that a downstream client consumed the stream. Cancellation or transport failure
+before raw completion prevents the assistant write where possible; an accepted
+POST cannot be rolled back. Memory read/write failures are reported only through
+the optional content-free `onDiagnostic` callback and do not overwrite successful
+model output. Scope violations remain hard failures before inference.
 
 ### Agent-managed session recording (no hooks)
 
@@ -63,7 +153,8 @@ console.log(result.finalStep.text);
 Instructions guide the model's tool choices; they do not guarantee that every
 message or the final reply is stored. Saving a long-term fact with
 `create_memories` is separate from recording conversation events. This toolset
-does not automatically load conversation history into the model context.
+does not automatically load conversation history into the model context; use the
+independent model wrapper above for deterministic restoration and injection.
 
 ### Automatic session recording with hooks
 

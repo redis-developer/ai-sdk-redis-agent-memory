@@ -49,7 +49,11 @@ try {
       `Unexpected published file: ${path}`,
     );
   }
-  for (const path of [...topLevelFiles, 'dist/index.js', 'dist/index.d.ts', 'src/index.ts']) {
+  for (const path of [
+    ...topLevelFiles,
+    'dist/index.js', 'dist/index.d.ts', 'dist/provider.js', 'dist/provider.d.ts',
+    'src/index.ts', 'src/provider.ts',
+  ]) {
     assert(files.has(path), `Required published file is missing: ${path}`);
   }
   console.log(`Verified tarball contents (${files.size} files).`);
@@ -68,16 +72,17 @@ try {
   ]);
 
   const packageName = JSON.stringify(manifest.name);
+  const providerPackageName = JSON.stringify(`${manifest.name}/provider`);
   writeFileSync(join(consumer, 'runtime.mjs'), `
 import assert from 'node:assert/strict';
 import {
-  RedisAgentMemory, createRedisAgentMemoryTools, irisMemoryInstructions, RedisAgentMemoryToolError,
+  RedisAgentMemory, createRedisAgentMemoryTools, instructions, RedisAgentMemoryToolError,
 } from ${packageName};
 
 assert.equal(typeof RedisAgentMemory, 'function');
 assert.equal(typeof createRedisAgentMemoryTools, 'function');
-assert.equal(typeof irisMemoryInstructions, 'string');
-assert(irisMemoryInstructions.length > 0);
+assert.equal(typeof instructions, 'string');
+assert(instructions.length > 0);
 assert(new RedisAgentMemoryToolError('TEST', 'Consumer verification') instanceof Error);
 
 globalThis.fetch = async () => { throw new Error('Package verification must not call a memory server.'); };
@@ -106,10 +111,30 @@ console.log('Verified installed ESM exports and tool construction without networ
 `);
   run([join(consumer, 'runtime.mjs')]);
 
+  writeFileSync(join(consumer, 'provider-runtime.mjs'), `
+import assert from 'node:assert/strict';
+import {
+  createRedisAgentMemoryProvider, RedisAgentMemoryToolError,
+} from ${providerPackageName};
+
+globalThis.fetch = async () => { throw new Error('Package verification must not call a memory server.'); };
+const provider = createRedisAgentMemoryProvider({
+  serverUrl: 'https://memory.example.invalid',
+  storeId: 'package-test-store',
+  apiKey: 'fake-package-verification-key',
+});
+assert(Object.isFrozen(provider));
+assert.deepEqual(Object.keys(provider), ['wrap']);
+assert.equal(typeof provider.wrap, 'function');
+assert(new RedisAgentMemoryToolError('TEST', 'Consumer verification') instanceof Error);
+console.log('Verified installed provider ESM subpath without network calls.');
+`);
+  run([join(consumer, 'provider-runtime.mjs')]);
+
   writeFileSync(join(consumer, 'consumer.ts'), `
 import { ToolLoopAgent, isStepCount, type LanguageModel, type ToolSet } from 'ai';
 import {
-  RedisAgentMemory, createRedisAgentMemoryTools, irisMemoryInstructions, RedisAgentMemoryToolError,
+  RedisAgentMemory, createRedisAgentMemoryTools, instructions, RedisAgentMemoryToolError,
   type RedisAgentMemoryOptions, type RedisAgentMemoryScope,
 } from ${packageName};
 
@@ -120,17 +145,63 @@ const scope: RedisAgentMemoryScope = { userId: 'package-test-user', sessionId: '
 const options: RedisAgentMemoryOptions = { allowDeletes: true, namespaceTools: true, timeoutMs: 5000 };
 const tools: ToolSet = new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options);
 const plainTools: ToolSet = createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options);
-const instructions: string = irisMemoryInstructions;
-const error: Error = new RedisAgentMemoryToolError('TEST', instructions);
+const memoryInstructions: string = instructions;
+const error: Error = new RedisAgentMemoryToolError('TEST', memoryInstructions);
 declare const model: LanguageModel;
 const agent = new ToolLoopAgent({
-  model, tools, instructions, stopWhen: isStepCount(8),
+  model, tools, instructions: memoryInstructions, stopWhen: isStepCount(8),
 });
 async function reply(): Promise<string> {
   const result = await agent.generate({ prompt: 'Recall my preferences.' });
   return result.finalStep.text;
 }
 void [tools, plainTools, error, reply];
+`);
+  writeFileSync(join(consumer, 'provider-consumer.ts'), `
+import {
+  createRedisAgentMemoryProvider,
+  RedisAgentMemoryToolError,
+  type RedisAgentMemoryDiagnostic,
+  type RedisAgentMemoryDiagnosticError,
+  type RedisAgentMemoryLimits,
+  type RedisAgentMemoryModelOptions,
+  type RedisAgentMemoryProvider,
+  type RedisAgentMemoryProviderOptions,
+  type RedisAgentMemoryProvenance,
+  type RedisAgentMemoryProvenanceEntry,
+  type RedisAgentMemoryScope,
+} from ${providerPackageName};
+
+const connection: RedisAgentMemoryProviderOptions = {
+  serverUrl: 'https://memory.example.invalid',
+  storeId: 'package-test-store',
+  apiKey: 'fake-package-verification-key',
+};
+const scope: RedisAgentMemoryScope = {
+  userId: 'package-test-user',
+  sessionId: 'package-test-session',
+};
+const limits: RedisAgentMemoryLimits = { memoryCount: 3, recordingChars: 10_000 };
+const onDiagnostic = (event: RedisAgentMemoryDiagnostic): void => {
+  const error: RedisAgentMemoryDiagnosticError | undefined = event.error;
+  void error;
+};
+const options: RedisAgentMemoryModelOptions = {
+  scope,
+  assistantId: 'package-test-assistant',
+  limits,
+  includeMemoryProvenance: true,
+  onDiagnostic,
+};
+const provider: RedisAgentMemoryProvider = createRedisAgentMemoryProvider(connection);
+declare const model: Parameters<RedisAgentMemoryProvider['wrap']>[0];
+const wrapped: ReturnType<RedisAgentMemoryProvider['wrap']> = provider.wrap(model, options);
+// @ts-expect-error The wrapper accepts configured models, not provider:model string IDs.
+provider.wrap('provider:model', options);
+const provenanceEntry: RedisAgentMemoryProvenanceEntry = { id: 'memory-id' };
+const provenance: RedisAgentMemoryProvenance = { memories: [provenanceEntry] };
+const error: Error = new RedisAgentMemoryToolError('TEST', provenanceEntry.id);
+void [wrapped, provenance, error];
 `);
   const compiler = join(consumer, 'node_modules', 'typescript', 'bin', 'tsc');
   const compilerArgs = [
@@ -139,7 +210,12 @@ void [tools, plainTools, error, reply];
   ];
   run([compiler, ...compilerArgs, '--module', 'NodeNext', '--moduleResolution', 'NodeNext']);
   run([compiler, ...compilerArgs, '--module', 'ESNext', '--moduleResolution', 'Bundler']);
-  console.log('Verified installed declarations and ToolSet compatibility with NodeNext and Bundler.');
+  for (const source of ['provider-consumer.ts']) {
+    const args = compilerArgs.with(compilerArgs.length - 1, source);
+    run([compiler, ...args, '--module', 'NodeNext', '--moduleResolution', 'NodeNext']);
+    run([compiler, ...args, '--module', 'ESNext', '--moduleResolution', 'Bundler']);
+  }
+  console.log('Verified root and provider declarations with NodeNext and Bundler.');
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

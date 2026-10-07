@@ -414,6 +414,7 @@ describe('createSessionEventHook', () => {
       { actorId: 'user-1', role: 'USER', content: [{ text: 'The question.' }] },
       { actorId: 'assistant-1', role: 'ASSISTANT', content: [{ text: 'The response.' }] },
     ]);
+    expect(http.requests.map(request => request.method)).toEqual(['GET', 'POST', 'GET', 'POST']);
     const modelTools = mode === 'generate' ? model.doGenerateCalls[0]!.tools : model.doStreamCalls[0]!.tools;
     expect(modelTools?.map(tool => tool.name)).not.toContain('createSessionEventHook');
   });
