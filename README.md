@@ -217,12 +217,18 @@ nonempty final text in `onEnd`. The hooks run independently and report save
 failures through `onError`. See [Recording session events](#recording-session-events)
 for input requirements, observers, and failure behavior.
 
-## Runnable demo
+## Runnable demos
 
-See [demo/](https://github.com/redis-developer/ai-sdk-redis-agent-memory/tree/main/demo)
-for a minimal terminal chat using the local package. Save a preference, start a
-new conversation with `/new`, and watch the agent recall it from Redis. Setup
-instructions are in the demo README. The demo is excluded from npm releases.
+- [demo2/ — automatic memory with Anthropic](demo2/README.md): a terminal chat using
+  the model wrapper, without memory tools or recording hooks. Each turn restores
+  its session from Iris; reuse the printed session ID to resume after restarting.
+  `/new` starts a separate session while retaining personal long-term recall.
+- [demo/ — memory tools with Anthropic](demo/README.md): the original terminal
+  chat with model-selected memory tools and application-managed recording hooks.
+
+Both use the local package and have separate setup instructions. Iris background
+extraction is asynchronous, so a new fact may not be available for cross-session
+recall immediately. Both demo directories are excluded from npm releases.
 
 ## Combining tools
 
