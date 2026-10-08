@@ -1,6 +1,6 @@
 # Anthropic automatic-memory demo
 
-This private Node.js 22 CLI shows the provider wrapper with Anthropic. The application sends only the current prompt and a short system instruction. A fresh wrapped model restores the configured Iris session, recalls relevant long-term memory, calls Anthropic, and records the turn automatically—there are no memory tools or local chat-history array.
+This private Node.js 22 CLI shows the provider wrapper with Anthropic. The application sends only the current prompt and a short system instruction. The reusable factory configures `anthropic(modelName)` and the Iris connection once. Inside the serial chat loop, `memory.forRequest(...)` creates a fresh request model for each turn. That model restores the configured Iris session, recalls relevant long-term memory, calls Anthropic, and records the turn automatically—there are no memory tools, recording hooks, or local chat-history array.
 
 ## Setup
 
@@ -32,7 +32,8 @@ Shell-exported variables take precedence over the optional `demo2/.env` file. Th
 
 - Keep `DEMO_USER_ID` stable to retain the same long-term-memory owner. If resuming a session created with the previous demo2 provider, retain its original user ID rather than adopting the new `demo-user` default.
 - The CLI prints its session UUID. To continue that exact session after a restart, run `DEMO_SESSION_ID=<printed-uuid> npm start` or put the UUID in `.env`.
-- Do not run parallel processes with the same `DEMO_SESSION_ID`; a wrapper is intended to own one turn at a time.
+- The session ID stays stable across turns; only `/new` changes it. Each turn gets a new request model, while steps/retries within one request would reuse that model. This demo disables automatic model retries.
+- Do not run parallel processes with the same `DEMO_SESSION_ID`; globally serialize requests for the exact session ID. Do not reuse a request model across turns or pass `model: memory` to a singleton agent: automatic agent-level lifecycle integration is not supported.
 - `/new` creates a new session while preserving the user and long-term-memory scope. `/clear` clears the terminal and `/quit` exits.
 - Iris long-term-memory extraction can be asynchronous, so a fact from the prior session is not guaranteed to be recallable immediately after `/new`.
 - Default reads and writes are best effort. Diagnostics show only operation, outcome, counts, write status, and HTTP status; they do not print response bodies, prompts, or credentials. An uncertain write may have reached the service even when its acknowledgement failed.
@@ -45,4 +46,4 @@ Shell-exported variables take precedence over the optional `demo2/.env` file. Th
 npm test
 ```
 
-The subprocess tests replace network transport and never use real credentials.
+The subprocess tests replace network transport and never use real credentials. They cover fresh request snapshots and USER writes across turns (including after a failed model call), session continuity and resume, `/new`, model overrides, scope enforcement, sanitized diagnostics, and zero network calls for configuration/session commands.

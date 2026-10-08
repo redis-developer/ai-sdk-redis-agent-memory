@@ -54,6 +54,7 @@ try {
     serverUrl: process.env.AGENT_MEMORY_URL,
     storeId: process.env.AGENT_MEMORY_STORE_ID,
     apiKey: process.env.AGENT_MEMORY_API_KEY,
+    model: anthropic(modelName),
   });
 } catch {
   console.error('Could not initialize Redis Agent Memory. Check its URL, store ID, and API key.');
@@ -97,9 +98,9 @@ try {
       console.clear();
     } else if (prompt) {
       try {
-        // A fresh wrapper owns exactly one turn. Iris restores and records the session;
+        // A fresh request model owns one turn. Iris restores and records the session;
         // the CLI deliberately keeps no local message-history array.
-        const model = memory.wrap(anthropic(modelName), {
+        const model = memory.forRequest({
           scope: { userId, sessionId },
           assistantId: 'demo-assistant',
           onDiagnostic: diagnostic,

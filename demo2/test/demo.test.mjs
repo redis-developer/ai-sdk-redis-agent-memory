@@ -47,7 +47,7 @@ function runDemo(input, overrides = {}) {
 const requestsOf = (result, kind) => result.requests.filter(request => request.kind === kind);
 const occurrences = (text, value) => text.split(value).length - 1;
 
-test('fresh wrappers restore the same session once per turn without tools or local message history', () => {
+test('fresh request models from one factory restore the same session once per turn without tools or local message history', () => {
   const result = runDemo('First question\nSecond question\n/quit\n');
   assert.equal(result.status, 0, result.stderr);
   const models = requestsOf(result, 'model');
@@ -58,6 +58,7 @@ test('fresh wrappers restore the same session once per turn without tools or loc
   assert.equal([...result.stdout.matchAll(/\[memory\] session\.restore /g)].length, 2);
   assert.deepEqual(requestsOf(result, 'session-append').map(request => request.body.role),
     ['USER', 'ASSISTANT', 'USER', 'ASSISTANT']);
+  assert.equal(new Set(requestsOf(result, 'session-append').map(request => request.body.sessionId)).size, 1);
   assert.doesNotMatch(JSON.stringify(models[0].body), /Earlier answer/);
   assert.match(JSON.stringify(models[1].body.messages), /First question/);
   assert.match(JSON.stringify(models[1].body.messages), /First answer/);
@@ -154,4 +155,30 @@ test('read and write failures are best effort and diagnostics never leak secrets
     assert.doesNotMatch(output, /anthropic-secret-sentinel|memory-secret-sentinel|private-response-body/);
     assert.doesNotMatch(output, /Details:|stack|headers/i);
   }
+});
+
+
+test('a failed turn does not leak its USER state or snapshot into the next request', () => {
+  const result = runDemo('Failed question\nNext question\n/quit\n', { DEMO_TEST_SCENARIO: 'first-model-failure' });
+  assert.equal(result.status, 0, result.stderr);
+  const models = requestsOf(result, 'model');
+  assert.equal(models.length, 2);
+  assert.equal(requestsOf(result, 'memory-search').length, 2);
+  const appends = requestsOf(result, 'session-append');
+  assert.deepEqual(appends.map(request => request.body.role), ['USER', 'USER', 'ASSISTANT']);
+  assert.deepEqual(appends.slice(0, 2).map(request => request.body.content), [
+    [{ text: 'Failed question' }], [{ text: 'Next question' }],
+  ]);
+  assert.equal(new Set(appends.map(request => request.body.sessionId)).size, 1);
+  assert.equal(occurrences(JSON.stringify(models[1].body.messages), 'Failed question'), 1);
+  assert.equal(occurrences(JSON.stringify(models[1].body.messages), 'Next question'), 1);
+  assert.match(result.stderr, /Anthropic request failed/);
+  assert.match(result.stdout, /Assistant: Second answer\./);
+});
+
+test('configuration and session commands make no model or memory calls', () => {
+  const result = runDemo('/new\n/clear\n/quit\n');
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.requests.length, 0);
+  assert.match(result.stdout, /New session/);
 });

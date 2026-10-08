@@ -28,7 +28,8 @@ globalThis.fetch = async (input, init) => {
   if (url.origin === 'https://api.anthropic.com' && url.pathname === '/v1/messages') {
     record({ kind: 'model', ...entry });
     modelCalls += 1;
-    if (process.env.DEMO_TEST_SCENARIO === 'model-failure') {
+    if (process.env.DEMO_TEST_SCENARIO === 'model-failure' ||
+      (process.env.DEMO_TEST_SCENARIO === 'first-model-failure' && modelCalls === 1)) {
       return Response.json({ type: 'error', error: { message: 'private-response-body', type: 'api_error' } }, { status: 500 });
     }
     const text = modelCalls === 1 ? 'First answer.'

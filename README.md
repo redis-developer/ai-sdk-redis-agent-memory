@@ -228,7 +228,8 @@ for input requirements, observers, and failure behavior.
 ## Runnable demos
 
 - [demo2/ — automatic memory with Anthropic](demo2/README.md): a terminal chat using
-  the model wrapper, without memory tools or recording hooks. Each turn restores
+  one reusable model/connection factory and `memory.forRequest()` per turn, without
+  memory tools or recording hooks. Each turn restores
   its session from Iris; reuse the printed session ID to resume after restarting.
   `/new` starts a separate session while retaining personal long-term recall.
 - [demo/ — memory tools with Anthropic](demo/README.md): the original terminal
