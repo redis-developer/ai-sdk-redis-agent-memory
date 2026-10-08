@@ -118,16 +118,40 @@ import {
 } from ${providerPackageName};
 
 globalThis.fetch = async () => { throw new Error('Package verification must not call a memory server.'); };
+const model = {
+  specificationVersion: 'v4',
+  provider: 'package-verification',
+  modelId: 'package-verification-model',
+  supportedUrls: {},
+  doGenerate: async () => { throw new Error('Package verification must not call the model.'); },
+  doStream: async () => { throw new Error('Package verification must not call the model.'); },
+};
 const provider = createRedisAgentMemoryProvider({
   serverUrl: 'https://memory.example.invalid',
   storeId: 'package-test-store',
   apiKey: 'fake-package-verification-key',
+  model,
 });
 assert(Object.isFrozen(provider));
-assert.deepEqual(Object.keys(provider), ['wrap']);
-assert.equal(typeof provider.wrap, 'function');
+assert.deepEqual(Object.keys(provider), ['forRequest']);
+assert.equal(typeof provider.forRequest, 'function');
+assert.equal(provider.wrap, undefined);
+const requestModel = provider.forRequest({
+  scope: { userId: 'package-test-user', sessionId: 'package-test-session' },
+  assistantId: 'package-test-assistant',
+});
+assert.equal(requestModel.specificationVersion, 'v4');
+assert.throws(() => createRedisAgentMemoryProvider({
+  serverUrl: 'https://memory.example.invalid', storeId: 'package-test-store', apiKey: 'key',
+}), /model|configuration/i);
+assert.throws(() => createRedisAgentMemoryProvider({
+  serverUrl: 'https://memory.example.invalid', storeId: 'package-test-store', apiKey: 'key', model: 'provider:model',
+}), /model|configuration/i);
+assert.throws(() => createRedisAgentMemoryProvider({
+  serverUrl: 'https://memory.example.invalid', storeId: 'package-test-store', apiKey: 'key', model: {},
+}), /model|configuration/i);
 assert(new RedisAgentMemoryToolError('TEST', 'Consumer verification') instanceof Error);
-console.log('Verified installed provider ESM subpath without network calls.');
+console.log('Verified installed provider ESM request-model construction and invalid model rejection without network calls.');
 `);
   run([join(consumer, 'provider-runtime.mjs')]);
 
@@ -158,6 +182,7 @@ async function reply(): Promise<string> {
 void [tools, plainTools, error, reply];
 `);
   writeFileSync(join(consumer, 'provider-consumer.ts'), `
+import { ToolLoopAgent, isStepCount, wrapLanguageModel } from 'ai';
 import {
   createRedisAgentMemoryProvider,
   RedisAgentMemoryToolError,
@@ -172,10 +197,14 @@ import {
   type RedisAgentMemoryScope,
 } from ${providerPackageName};
 
+type ConfiguredModel = Parameters<typeof wrapLanguageModel>[0]['model'];
+declare const configuredModel: ConfiguredModel;
+declare const optionalModel: ConfiguredModel | undefined;
 const connection: RedisAgentMemoryProviderOptions = {
   serverUrl: 'https://memory.example.invalid',
   storeId: 'package-test-store',
   apiKey: 'fake-package-verification-key',
+  model: configuredModel,
 };
 const scope: RedisAgentMemoryScope = {
   userId: 'package-test-user',
@@ -194,14 +223,22 @@ const options: RedisAgentMemoryModelOptions = {
   onDiagnostic,
 };
 const provider: RedisAgentMemoryProvider = createRedisAgentMemoryProvider(connection);
-declare const model: Parameters<RedisAgentMemoryProvider['wrap']>[0];
-const wrapped: ReturnType<RedisAgentMemoryProvider['wrap']> = provider.wrap(model, options);
-// @ts-expect-error The wrapper accepts configured models, not provider:model string IDs.
-provider.wrap('provider:model', options);
+const requestModel: ReturnType<RedisAgentMemoryProvider['forRequest']> = provider.forRequest(options);
+const agent = new ToolLoopAgent({ model: requestModel, stopWhen: isStepCount(8) });
+// @ts-expect-error The configured model is required.
+createRedisAgentMemoryProvider({ serverUrl: connection.serverUrl });
+// @ts-expect-error Provider:model string IDs are not configured model instances.
+createRedisAgentMemoryProvider({ ...connection, model: 'provider:model' });
+// @ts-expect-error An optional configured model cannot satisfy the required model field.
+createRedisAgentMemoryProvider({ ...connection, model: optionalModel });
+// @ts-expect-error Malformed objects are not configured models.
+createRedisAgentMemoryProvider({ ...connection, model: {} });
+// @ts-expect-error The unreleased wrap API was removed rather than retained as an alias.
+provider.wrap(configuredModel, options);
 const provenanceEntry: RedisAgentMemoryProvenanceEntry = { id: 'memory-id' };
 const provenance: RedisAgentMemoryProvenance = { memories: [provenanceEntry] };
 const error: Error = new RedisAgentMemoryToolError('TEST', provenanceEntry.id);
-void [wrapped, provenance, error];
+void [requestModel, agent, provenance, error];
 `);
   const compiler = join(consumer, 'node_modules', 'typescript', 'bin', 'tsc');
   const compilerArgs = [

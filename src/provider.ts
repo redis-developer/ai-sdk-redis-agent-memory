@@ -24,6 +24,7 @@ type ProviderMetadata = ModelGenerateResult['providerMetadata'];
 export type RedisAgentMemoryScope = BaseScope & { userId: string };
 
 export interface RedisAgentMemoryProviderOptions {
+  model: ConfiguredLanguageModel;
   serverUrl?: string;
   storeId?: string;
   apiKey?: string;
@@ -80,7 +81,8 @@ export interface RedisAgentMemoryProvenance {
 }
 
 export interface RedisAgentMemoryProvider {
-  wrap(model: ConfiguredLanguageModel, options: RedisAgentMemoryModelOptions): WrappedLanguageModel;
+  /** Create one model per application request; reuse it only for that request's steps and retries. */
+  forRequest(options: RedisAgentMemoryModelOptions): WrappedLanguageModel;
 }
 
 type Limits = Required<RedisAgentMemoryLimits>;
@@ -366,9 +368,15 @@ function isoTimestamp(value: unknown): string | undefined {
 
 /** Create an immutable provider-like factory around an already configured AI SDK model. */
 export function createRedisAgentMemoryProvider(
-  providerOptions: RedisAgentMemoryProviderOptions = {},
+  providerOptions: RedisAgentMemoryProviderOptions,
 ): RedisAgentMemoryProvider {
-  const connection = Object.freeze({ ...providerOptions });
+  const { model, ...connection } = providerOptions;
+  if (!model || typeof model !== 'object' ||
+    !['v2', 'v3', 'v4'].includes(model.specificationVersion) ||
+    typeof model.provider !== 'string' || typeof model.modelId !== 'string' ||
+    typeof model.doGenerate !== 'function' || typeof model.doStream !== 'function') {
+    throw providerError('INVALID_CONFIGURATION', 'Redis Agent Memory provider requires a configured language model.');
+  }
   let client: ReturnType<typeof resolveAgentMemoryClient>;
   try {
     client = resolveAgentMemoryClient(connection.serverUrl, connection.storeId, connection.apiKey);
@@ -377,7 +385,7 @@ export function createRedisAgentMemoryProvider(
   }
 
   const provider: RedisAgentMemoryProvider = {
-    wrap(model, inputOptions) {
+    forRequest(inputOptions) {
       const options = Object.freeze({ ...inputOptions });
       const scope = parseScope(options.scope);
       const historyMode = options.historyMode ?? 'iris';

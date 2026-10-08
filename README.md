@@ -21,7 +21,8 @@ These examples use Anthropic directly; install its provider with `npm install @a
 
 ### Automatic context and recording (recommended)
 
-Wrap an already configured model from the independent `./provider` subpath. The
+Configure a model and Iris connection once with the independent `./provider`
+subpath, then create a request-scoped model with `memory.forRequest()`. The
 wrapper restores the Iris session, recalls personal long-term memories, injects a
 bounded untrusted context block, and records the current user input plus every
 successful text-bearing raw assistant step. It does not expose memory tools to the
@@ -32,34 +33,41 @@ outside the independently configured session and long-term-memory character budg
 
 ```ts
 import { anthropic } from '@ai-sdk/anthropic';
-import { generateText } from 'ai';
+import { ToolLoopAgent, isStepCount } from 'ai';
 import { createRedisAgentMemoryProvider } from 'ai-sdk-redis-agent-memory/provider';
 
 const memory = createRedisAgentMemoryProvider({
   serverUrl: process.env.AGENT_MEMORY_URL,
   storeId: process.env.AGENT_MEMORY_STORE_ID,
   apiKey: process.env.AGENT_MEMORY_API_KEY,
+  model: anthropic('claude-sonnet-4-5'),
 });
 
-// Derive these IDs from authenticated, application-owned state, not request input.
-const userId = 'user-123';
-const sessionId = 'conversation-456';
-
-// Create one wrapped model per application request. Do not reuse it for another request.
-const model = memory.wrap(anthropic('claude-sonnet-4-5'), {
-  scope: { userId, sessionId },
-  assistantId: 'assistant-1',
-});
-
-const result = await generateText({
-  model,
-  prompt: 'Remember that I prefer TypeScript examples.',
-});
-console.log(result.text);
+// Inside each application request. Derive IDs from authenticated state.
+async function reply(userId: string, sessionId: string, prompt: string) {
+  const agent = new ToolLoopAgent({
+    model: memory.forRequest({
+      scope: { userId, sessionId },
+      assistantId: 'assistant',
+    }),
+    stopWhen: isStepCount(8),
+  });
+  return agent.generate({ prompt });
+}
 ```
 
+The factory shares the configured model and Iris client across requests. Each
+`forRequest()` result owns its scope, recall/restoration snapshot, USER-write
+attempt, recording budget, and concurrency/cancellation state. Reuse that result
+for steps and retries **within one request**, never across independent requests.
+Factory and request-model construction make no network calls. Overlapping calls
+on the same request model are rejected; separate request models may run
+concurrently for distinct sessions. Do not pass `model: memory` to a singleton
+agent: automatic agent-level request lifecycle integration is not supported.
+This unreleased API replaces `wrap(model, options)`; there is no `wrap()` alias.
+
 The default `historyMode: 'iris'` owns conversation history: it restores the
-session and defaults `recording` to `true`, giving a fresh wrapper for the same
+session and defaults `recording` to `true`, giving a fresh request model for the same
 session the ability to pick up where the previous request stopped. The current
 USER event is written once before inference; every successful raw model step with
 generated text is written afterward, including intermediate tool-loop steps, not
@@ -75,7 +83,7 @@ history. It does not restore session events and defaults recording off, but stil
 recalls long-term memory:
 
 ```ts
-const model = memory.wrap(anthropic('claude-sonnet-4-5'), {
+const model = memory.forRequest({
   scope: { userId, sessionId },
   historyMode: 'application',
   recording: false,
