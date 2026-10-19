@@ -1,7 +1,28 @@
 # Redis Agent Memory for Vercel's AI SDK
 
-This integration provides an automatic memory model wrapper and optional short-term
-and long-term memory tools for agents developed with Vercel's [AI SDK](https://ai-sdk.dev/).
+This integration provides short-term and long-term memory tools to agents developed with Vercel's [AI SDK](https://ai-sdk.dev/).
+
+It also provides a **memory provider** that wraps a configured model to restore
+session history, recall personal long-term memories, and record conversational
+text automatically. Choose the integration that fits your application; the tools
+API remains supported and works independently of the provider.
+
+## Choose an approach
+
+| | Tools | Provider |
+| --- | --- | --- |
+| Entry point | `ai-sdk-redis-agent-memory` | `ai-sdk-redis-agent-memory/provider` |
+| Setup | `createRedisAgentMemoryTools(...)` or `new RedisAgentMemory(...)` | `createRedisAgentMemoryProvider({ model, ...connection })` |
+| Agent integration | Pass the tool map as `tools` alongside your model | Pass `memory.forRequest(options)` as the request's `model` |
+| Recall and history | The model chooses memory tools; the application manages its input history | By default, restores the scoped session and injects recalled personal memories before inference |
+| Session recording | Model-selected session tools, or optional application lifecycle hooks | Automatic USER recording and successful text-bearing assistant steps by default in Iris-managed mode |
+| Choose when | You want explicit memory operations, selective tools, or model-directed memory management | You want automatic context and session continuity without model-selected memory tools |
+| Quick start | [Agent-managed recording](#agent-managed-session-recording-no-hooks) or [recording hooks](#automatic-session-recording-with-hooks) | [Automatic context and recording](#provider-automatic-context-and-recording) |
+
+Hooks are an optional recording mode of the tools approach, not a prerequisite
+for either integration. Both approaches use Iris and application-owned scope.
+They may coexist, but do not enable provider recording and session-write tools or
+recording hooks for the same interaction: that can duplicate events.
 
 ## Installation
 
@@ -17,9 +38,123 @@ Before that release, [build and install a local tarball](#development). Provisio
 
 ## Quick start
 
-These examples use Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible configured models work the same way.
+These examples use Anthropic directly; install its provider with `npm install @ai-sdk/anthropic@^4` and set `ANTHROPIC_API_KEY`. Other AI SDK 7-compatible model providers work with the same toolset.
 
-### Automatic context and recording (recommended)
+The tools examples come first; the [provider example](#provider-automatic-context-and-recording)
+uses the same Anthropic model, configured once in a reusable memory factory.
+
+### Agent-managed session recording (no hooks)
+
+Give the agent the memory tools and let it decide when to record session events
+or save long-term facts. This example has no application-managed session logging.
+
+```ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { ToolLoopAgent, isStepCount } from 'ai';
+import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
+
+// Your application supplies these from authenticated user/conversation state.
+const userId = 'user-123';
+const sessionId = 'conversation-456';
+const agentId = 'assistant-1';
+
+const tools = createRedisAgentMemoryTools(
+  // Defaults to AGENT_MEMORY_URL or https://gcp-us-east4.memory.redis.io.
+  process.env.AGENT_MEMORY_URL,
+  process.env.AGENT_MEMORY_STORE_ID,
+  process.env.AGENT_MEMORY_API_KEY,
+  { userId, sessionId },
+);
+
+const agent = new ToolLoopAgent({
+  model: anthropic('claude-sonnet-4-5'),
+  tools,
+  instructions: `${instructions}
+Current user and memory owner: ${userId}
+Current session: ${sessionId}
+Current assistant actor: ${agentId}
+The application does not log session events. Decide when to record this conversation
+using start_session or add_session_event. Start a new session with the user's
+message, then use add_session_event for subsequent USER and ASSISTANT events.`,
+  stopWhen: isStepCount(8),
+});
+
+const result = await agent.generate({
+  prompt: 'Remember that I prefer TypeScript examples.',
+});
+console.log(result.finalStep.text);
+```
+
+Instructions guide the model's tool choices; they do not guarantee that every
+message or the final reply is stored. Saving a long-term fact with
+`create_memories` is separate from recording conversation events. This toolset
+does not automatically load conversation history into the model context.
+
+For automatic restoration and context injection instead of model-selected memory
+tools, use the [provider approach](#provider-automatic-context-and-recording) below.
+
+### Automatic session recording with hooks
+
+Use the same factory with `onStart` and `onEnd` to record the current user message
+and the final assistant reply independently of the model's tool choices. Keep
+session-write tools out of `activeTools` to avoid duplicate recording; the agent
+can still decide when to save and retrieve long-term memories.
+
+```ts
+import { anthropic } from '@ai-sdk/anthropic';
+import { ToolLoopAgent, isStepCount } from 'ai';
+import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
+
+// Your application supplies these from authenticated user/conversation state.
+const userId = 'user-123';
+const sessionId = 'conversation-456';
+const agentId = 'assistant-1';
+
+const tools = createRedisAgentMemoryTools(
+  process.env.AGENT_MEMORY_URL,
+  process.env.AGENT_MEMORY_STORE_ID,
+  process.env.AGENT_MEMORY_API_KEY,
+  { userId, sessionId },
+);
+
+const agent = new ToolLoopAgent({
+  model: anthropic('claude-sonnet-4-5'),
+  tools,
+  activeTools: [
+    'get_memory_context', 'get_session_memory',
+    'create_memories', 'search_memories', 'update_memory',
+  ],
+  instructions: `${instructions}
+Current user and memory owner: ${userId}
+Current session: ${sessionId}
+Current assistant actor: ${agentId}
+The application records user input before generation and the final reply afterward.
+Do not write session events. Use get_session_memory to read saved messages.`,
+  stopWhen: isStepCount(8),
+  onStart: tools.createSessionEventHook({
+    role: 'USER',
+    actorId: userId,
+    onError: error => console.error('USER session save failed:', error.message),
+  }),
+  onEnd: tools.createSessionEventHook({
+    role: 'ASSISTANT',
+    actorId: agentId,
+    onError: error => console.error('ASSISTANT session save failed:', error.message),
+  }),
+});
+
+const result = await agent.generate({
+  prompt: 'Remember that I prefer TypeScript examples.',
+});
+console.log(result.finalStep.text);
+```
+
+The USER write is awaited before the model starts, and the ASSISTANT hook records
+nonempty final text in `onEnd`. The hooks run independently and report save
+failures through `onError`. See [Recording session events](#recording-session-events)
+for input requirements, observers, and failure behavior.
+
+### Provider: automatic context and recording
 
 Configure a model and Iris connection once with the independent `./provider`
 subpath, then create a request-scoped model with `memory.forRequest()`. The
@@ -116,124 +251,23 @@ POST cannot be rolled back. Memory read/write failures are reported only through
 the optional content-free `onDiagnostic` callback and do not overwrite successful
 model output. Scope violations remain hard failures before inference.
 
-### Agent-managed session recording (no hooks)
+## Runnable demo
 
-Give the agent the memory tools and let it decide when to record session events
-or save long-term facts. This example has no application-managed session logging.
+See [demo/](https://github.com/redis-developer/ai-sdk-redis-agent-memory/tree/main/demo)
+for a minimal terminal chat using the local package. Save a preference, start a
+new conversation with `/new`, and watch the agent recall it from Redis. Setup
+instructions are in the demo README. The demo is excluded from npm releases.
 
-```ts
-import { anthropic } from '@ai-sdk/anthropic';
-import { ToolLoopAgent, isStepCount } from 'ai';
-import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
+The original demo uses model-selected memory tools and application-managed
+recording hooks.
 
-// Your application supplies these from authenticated user/conversation state.
-const userId = 'user-123';
-const sessionId = 'conversation-456';
-const agentId = 'assistant-1';
+### Provider demo
 
-const tools = createRedisAgentMemoryTools(
-  // Defaults to AGENT_MEMORY_URL or https://gcp-us-east4.memory.redis.io.
-  process.env.AGENT_MEMORY_URL,
-  process.env.AGENT_MEMORY_STORE_ID,
-  process.env.AGENT_MEMORY_API_KEY,
-  { userId, sessionId },
-);
-
-const agent = new ToolLoopAgent({
-  model: anthropic('claude-sonnet-4-5'),
-  tools,
-  instructions: `${instructions}
-Current user and memory owner: ${userId}
-Current session: ${sessionId}
-Current assistant actor: ${agentId}
-The application does not log session events. Decide when to record this conversation
-using start_session or add_session_event. Start a new session with the user's
-message, then use add_session_event for subsequent USER and ASSISTANT events.`,
-  stopWhen: isStepCount(8),
-});
-
-const result = await agent.generate({
-  prompt: 'Remember that I prefer TypeScript examples.',
-});
-console.log(result.finalStep.text);
-```
-
-Instructions guide the model's tool choices; they do not guarantee that every
-message or the final reply is stored. Saving a long-term fact with
-`create_memories` is separate from recording conversation events. This toolset
-does not automatically load conversation history into the model context; use the
-independent model wrapper above for deterministic restoration and injection.
-
-### Automatic session recording with hooks
-
-Use the same factory with `onStart` and `onEnd` to record the current user message
-and the final assistant reply independently of the model's tool choices. Keep
-session-write tools out of `activeTools` to avoid duplicate recording; the agent
-can still decide when to save and retrieve long-term memories.
-
-```ts
-import { anthropic } from '@ai-sdk/anthropic';
-import { ToolLoopAgent, isStepCount } from 'ai';
-import { createRedisAgentMemoryTools, instructions } from 'ai-sdk-redis-agent-memory';
-
-// Your application supplies these from authenticated user/conversation state.
-const userId = 'user-123';
-const sessionId = 'conversation-456';
-const agentId = 'assistant-1';
-
-const tools = createRedisAgentMemoryTools(
-  process.env.AGENT_MEMORY_URL,
-  process.env.AGENT_MEMORY_STORE_ID,
-  process.env.AGENT_MEMORY_API_KEY,
-  { userId, sessionId },
-);
-
-const agent = new ToolLoopAgent({
-  model: anthropic('claude-sonnet-4-5'),
-  tools,
-  activeTools: [
-    'get_memory_context', 'get_session_memory',
-    'create_memories', 'search_memories', 'update_memory',
-  ],
-  instructions: `${instructions}
-Current user and memory owner: ${userId}
-Current session: ${sessionId}
-Current assistant actor: ${agentId}
-The application records user input before generation and the final reply afterward.
-Do not write session events. Use get_session_memory to read saved messages.`,
-  stopWhen: isStepCount(8),
-  onStart: tools.createSessionEventHook({
-    role: 'USER',
-    actorId: userId,
-    onError: error => console.error('USER session save failed:', error.message),
-  }),
-  onEnd: tools.createSessionEventHook({
-    role: 'ASSISTANT',
-    actorId: agentId,
-    onError: error => console.error('ASSISTANT session save failed:', error.message),
-  }),
-});
-
-const result = await agent.generate({
-  prompt: 'Remember that I prefer TypeScript examples.',
-});
-console.log(result.finalStep.text);
-```
-
-The USER write is awaited before the model starts, and the ASSISTANT hook records
-nonempty final text in `onEnd`. The hooks run independently and report save
-failures through `onError`. See [Recording session events](#recording-session-events)
-for input requirements, observers, and failure behavior.
-
-## Runnable demos
-
-- [demo2/ — automatic memory with Anthropic](demo2/README.md): a terminal chat using
-  one reusable model/connection factory and `memory.forRequest()` per turn, without
-  memory tools or recording hooks. Each turn restores
-  its session from Iris; reuse the printed session ID to resume after restarting.
-  `/new` starts a separate session while retaining personal long-term recall.
-- [demo/ — memory tools with Anthropic](demo/README.md): the original terminal
-  chat with model-selected memory tools and application-managed recording hooks.
+[demo2/ — automatic memory with Anthropic](demo2/README.md): a terminal chat using
+one reusable model/connection factory and `memory.forRequest()` per turn, without
+memory tools or recording hooks. Each turn restores its session from Iris; reuse
+the printed session ID to resume after restarting. `/new` starts a separate
+session while retaining personal long-term recall.
 
 Both use the local package and have separate setup instructions. Iris background
 extraction is asynchronous, so a new fact may not be available for cross-session
@@ -344,6 +378,9 @@ through `onError`. To require persistence before proceeding with generation or
 returning a reply, use the official SDK in your application workflow.
 
 ## Configuration
+
+This section covers the **tools** approach. The **provider** accepts an options
+object, not positional arguments; see the [provider example](#provider-automatic-context-and-recording).
 
 The factory accepts these positional arguments:
 
