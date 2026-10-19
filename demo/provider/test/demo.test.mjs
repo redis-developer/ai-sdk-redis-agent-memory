@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -181,4 +181,16 @@ test('configuration and session commands make no model or memory calls', () => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.requests.length, 0);
   assert.match(result.stdout, /New session/);
+});
+
+test('provider migration uses the unified root API and per-turn models', () => {
+  const source = readFileSync(entrypoint, 'utf8');
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.match(source, /import\('ai-sdk-redis-agent-memory'\)/);
+  assert.match(source, /createRedisAgentMemory\(/);
+  assert.match(source, /for await[\s\S]*const model = memory\.model\(/);
+  assert.doesNotMatch(source, /forRequest|createRedisAgentMemoryProvider|ai-sdk-redis-agent-memory\/provider/);
+  assert.equal(manifest.dependencies['ai-sdk-redis-agent-memory'], 'file:../..');
+  assert.equal(realpathSync(fileURLToPath(import.meta.resolve('ai-sdk-redis-agent-memory'))),
+    realpathSync(fileURLToPath(new URL('../../../dist/index.js', import.meta.url))));
 });

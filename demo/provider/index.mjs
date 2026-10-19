@@ -20,7 +20,7 @@ try {
 const required = ['ANTHROPIC_API_KEY', 'AGENT_MEMORY_API_KEY', 'AGENT_MEMORY_STORE_ID'];
 const missing = required.filter(name => !process.env[name]?.trim());
 if (missing.length > 0) {
-  console.error(`Set ${missing.join(', ')} in demo2/.env (see .env.example).`);
+  console.error(`Set ${missing.join(', ')} in demo/provider/.env (see .env.example).`);
   process.exit(1);
 }
 
@@ -40,17 +40,17 @@ if (configuredSessionId && !uuid.test(configuredSessionId)) {
 const [
   { anthropic },
   { APICallError, generateText, LoadAPIKeyError },
-  { createRedisAgentMemoryProvider, RedisAgentMemoryToolError },
+  { createRedisAgentMemory, RedisAgentMemoryToolError },
 ] = await Promise.all([
   import('@ai-sdk/anthropic'),
   import('ai'),
-  import('ai-sdk-redis-agent-memory/provider'),
+  import('ai-sdk-redis-agent-memory'),
 ]);
 
 const modelName = process.env.ANTHROPIC_MODEL?.trim() || 'claude-sonnet-4-5';
 let memory;
 try {
-  memory = createRedisAgentMemoryProvider({
+  memory = createRedisAgentMemory({
     serverUrl: process.env.AGENT_MEMORY_URL,
     storeId: process.env.AGENT_MEMORY_STORE_ID,
     apiKey: process.env.AGENT_MEMORY_API_KEY,
@@ -100,7 +100,7 @@ try {
       try {
         // A fresh request model owns one turn. Iris restores and records the session;
         // the CLI deliberately keeps no local message-history array.
-        const model = memory.forRequest({
+        const model = memory.model({
           scope: { userId, sessionId },
           assistantId: 'demo-assistant',
           onDiagnostic: diagnostic,

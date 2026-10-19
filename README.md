@@ -227,25 +227,10 @@ violations remain hard failures.
 ## Runnable demos
 
 - [`demo/tools/`](demo/tools/) demonstrates the explicit tools and recording-hook approach.
+- [`demo/provider/`](demo/provider/) demonstrates the automatic-memory model approach.
 
-The tools demo has independent installation, test, and startup instructions and
-is excluded from npm releases. The automatic-memory demo is introduced by
-stacked [PR #3](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/3).
-
-The original demo uses model-selected memory tools and application-managed
-recording hooks.
-
-### Provider demo
-
-[demo2/ — automatic memory with Anthropic](demo2/README.md): a terminal chat using
-one reusable model/connection factory and `memory.forRequest()` per turn, without
-memory tools or recording hooks. Each turn restores its session from Iris; reuse
-the printed session ID to resume after restarting. `/new` starts a separate
-session while retaining personal long-term recall.
-
-Both use the local package and have separate setup instructions. Iris background
-extraction is asynchronous, so a new fact may not be available for cross-session
-recall immediately. Both demo directories are excluded from npm releases.
+Each demo has independent installation, test, and startup instructions and is
+excluded from npm releases.
 
 ## Combining tools
 
