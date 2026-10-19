@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ToolLoopAgent, isStepCount, type ToolSet } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import {
-  RedisAgentMemory, createRedisAgentMemoryTools, instructions,
+  createRedisAgentMemory, instructions,
   type RedisAgentMemoryOptions, type RedisAgentMemoryScope,
 } from '../src/index.js';
 
@@ -64,13 +64,23 @@ async function run(tools: ToolSet, name: string, input: unknown, abortSignal?: A
   return definition.execute(parsed, { toolCallId: 'test-call', messages: [], abortSignal, context: {} });
 }
 
+function makeTools(
+  serverUrl?: string,
+  storeId?: string,
+  key?: string,
+  scope: RedisAgentMemoryScope = {},
+  options: RedisAgentMemoryOptions = {},
+) {
+  return createRedisAgentMemory({ ...options, serverUrl, storeId, apiKey: key, scope }).tools();
+}
+
 function toolsWith(
   fetch: typeof globalThis.fetch,
   scope: RedisAgentMemoryScope = {},
   options: RedisAgentMemoryOptions = {},
 ) {
   vi.stubGlobal('fetch', fetch);
-  return new RedisAgentMemory(serverURL, 'store-1', apiKey, scope, options);
+  return makeTools(serverURL, 'store-1', apiKey, scope, options);
 }
 
 describe('RedisAgentMemory toolset', () => {
@@ -97,21 +107,17 @@ describe('RedisAgentMemory toolset', () => {
     { options: { allowDeletes: true }, deletes: true, namespaces: false },
     { options: { namespaceTools: true }, deletes: false, namespaces: true },
     { options: { allowDeletes: true, namespaceTools: true }, deletes: true, namespaces: true },
-  ])('exposes only the tools enabled by $options in both APIs', async ({ options, deletes, namespaces }) => {
-    for (const tools of [
-      createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, undefined, options),
-      new RedisAgentMemory(serverURL, 'store-1', apiKey, undefined, options),
-    ]) {
-      expect(tools.search_memories).toBeDefined();
-      for (const name of ['delete_memories', 'delete_session_event', 'delete_session_memory']) {
-        expect(tools[name] !== undefined).toBe(deletes);
-      }
-      for (const name of ['list_namespaces', 'get_namespace', 'create_namespace', 'update_namespace', 'move_memories']) {
-        expect(tools[name] !== undefined).toBe(namespaces);
-      }
-      expect(tools.delete_namespace !== undefined).toBe(deletes && namespaces);
-      expect(await run(tools, 'get_memory_context', {})).toHaveProperty('allowDeletes', deletes);
+  ])('exposes only the tools enabled by $options', async ({ options, deletes, namespaces }) => {
+    const tools = makeTools(serverURL, 'store-1', apiKey, undefined, options);
+    expect(tools.search_memories).toBeDefined();
+    for (const name of ['delete_memories', 'delete_session_event', 'delete_session_memory']) {
+      expect(tools[name] !== undefined).toBe(deletes);
     }
+    for (const name of ['list_namespaces', 'get_namespace', 'create_namespace', 'update_namespace', 'move_memories']) {
+      expect(tools[name] !== undefined).toBe(namespaces);
+    }
+    expect(tools.delete_namespace !== undefined).toBe(deletes && namespaces);
+    expect(await run(tools, 'get_memory_context', {})).toHaveProperty('allowDeletes', deletes);
   });
 
   it('uses environment configuration when positional connection arguments are omitted', async () => {
@@ -121,21 +127,21 @@ describe('RedisAgentMemory toolset', () => {
     const http = transport({ body: { items: [] } });
     vi.stubGlobal('fetch', http.fetch);
 
-    await run(createRedisAgentMemoryTools(), 'search_memories', {});
+    await run(makeTools(), 'search_memories', {});
 
     const { request } = http.requests[0]!;
     expect(request.url).toBe('https://environment.example.test/v1/stores/environment-store/long-term-memory/search');
     expect(request.headers.get('authorization')).toBe('Bearer environment-key');
   });
 
-  it('uses positional connection arguments ahead of environment configuration and copies scope', async () => {
+  it('uses explicit connection options ahead of environment configuration and copies scope', async () => {
     vi.stubEnv('AGENT_MEMORY_URL', 'https://environment.example.test');
     vi.stubEnv('AGENT_MEMORY_STORE_ID', 'environment-store');
     vi.stubEnv('AGENT_MEMORY_API_KEY', 'environment-key');
     const http = transport({ body: { items: [] } });
     vi.stubGlobal('fetch', http.fetch);
     const scope = { userId: 'user-1', sessionId: 'session-1' };
-    const tools = createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, scope);
+    const tools = makeTools(serverURL, 'store-1', apiKey, scope);
     scope.userId = 'changed-user';
     scope.sessionId = 'changed-session';
 
@@ -155,20 +161,20 @@ describe('RedisAgentMemory toolset', () => {
     const http = transport({ body: { items: [] } });
     vi.stubGlobal('fetch', http.fetch);
 
-    await run(createRedisAgentMemoryTools(undefined, 'store-1', apiKey), 'search_memories', {});
+    await run(makeTools(undefined, 'store-1', apiKey), 'search_memories', {});
 
     expect(http.requests[0]!.request.url).toBe('https://gcp-us-east4.memory.redis.io/v1/stores/store-1/long-term-memory/search');
   });
 
-  it('fails at construction when required credentials are missing', () => {
+  it('fails at construction when required connection options are missing', () => {
     vi.stubEnv('AGENT_MEMORY_API_KEY', undefined);
     vi.stubEnv('AGENT_MEMORY_STORE_ID', undefined);
-    expect(() => createRedisAgentMemoryTools(serverURL, 'store-1')).toThrow('AGENT_MEMORY_API_KEY');
-    expect(() => createRedisAgentMemoryTools(serverURL, undefined, apiKey)).toThrow('AGENT_MEMORY_STORE_ID');
+    expect(() => makeTools(serverURL, 'store-1')).toThrow('AGENT_MEMORY_API_KEY');
+    expect(() => makeTools(serverURL, undefined, apiKey)).toThrow('AGENT_MEMORY_STORE_ID');
   });
 
   it.each([0, -1, NaN, Infinity])('rejects an invalid request timeout of %s', timeoutMs => {
-    expect(() => createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, undefined, { timeoutMs })).toThrow('timeoutMs');
+    expect(() => makeTools(serverURL, 'store-1', apiKey, undefined, { timeoutMs })).toThrow('timeoutMs');
   });
 
   it('aborts a stalled HTTP request after the configured timeout', async () => {

@@ -7,7 +7,7 @@ import type {
 import { stepCountIs, streamText, tool } from 'ai';
 import { MockLanguageModelV4, convertArrayToReadableStream } from 'ai/test';
 import { z } from 'zod';
-import { createRedisAgentMemoryProvider, type RedisAgentMemoryDiagnostic } from '../src/provider.js';
+import { createRedisAgentMemory, type RedisAgentMemoryDiagnostic } from '../src/index.js';
 
 const serverUrl = 'https://stream.example.test';
 const timestamp = '2026-10-07T12:00:00.000Z';
@@ -45,8 +45,8 @@ function setupTransport(options: { holdAssistant?: boolean; failAssistant?: bool
   return { requests, releaseAssistant };
 }
 
-function forRequest(model: MockLanguageModelV4, options: Record<string, unknown> = {}) {
-  return createRedisAgentMemoryProvider({ serverUrl, storeId: 'store-1', apiKey: 'secret-key', model }).forRequest({
+function requestModel(model: MockLanguageModelV4, options: Record<string, unknown> = {}) {
+  return createRedisAgentMemory({ serverUrl, storeId: 'store-1', apiKey: 'secret-key', model }).model({
     scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1', ...options,
   });
 }
@@ -73,7 +73,7 @@ describe('Redis Agent Memory provider streaming', () => {
       request: { body: { retained: true } }, response: { headers: { 'x-base': 'yes' } },
     }) });
 
-    const result = await forRequest(model).doStream(params);
+    const result = await requestModel(model).doStream(params);
     expect(result.request).toEqual({ body: { retained: true } });
     expect(result.response).toEqual({ headers: { 'x-base': 'yes' } });
     const reader = result.stream.getReader();
@@ -99,7 +99,7 @@ describe('Redis Agent Memory provider streaming', () => {
       ]),
     }) });
 
-    await forRequest(model).doStream(params);
+    await requestModel(model).doStream(params);
 
     await vi.waitFor(() => expect(http.requests.filter(({ body }) => body?.role === 'ASSISTANT')).toHaveLength(1));
   });
@@ -124,7 +124,7 @@ describe('Redis Agent Memory provider streaming', () => {
       },
     }) }) });
 
-    const reader = (await forRequest(model).doStream(params)).stream.getReader();
+    const reader = (await requestModel(model).doStream(params)).stream.getReader();
     expect((await reader.read()).value).toBe(start);
     releaseError();
     await expect(reader.read()).rejects.toBe(failure);
@@ -142,7 +142,7 @@ describe('Redis Agent Memory provider streaming', () => {
       ]),
     }) });
 
-    const parts = await readAll((await forRequest(model).doStream(params)).stream);
+    const parts = await readAll((await requestModel(model).doStream(params)).stream);
     expect(parts).toEqual([{ type: 'text-delta', id: 'answer', delta: 'Partial.' }, errorPart]);
     expect(parts[1]).toBe(errorPart);
     expect(http.requests.filter(({ body }) => body?.role === 'ASSISTANT')).toHaveLength(0);
@@ -151,7 +151,7 @@ describe('Redis Agent Memory provider streaming', () => {
   it('closes without a synthetic finish or assistant write when upstream closes without finish', async () => {
     const http = setupTransport();
     const start = { type: 'stream-start' as const, warnings: [] };
-    const result = await forRequest(new MockLanguageModelV4({ doStream: async () => ({
+    const result = await requestModel(new MockLanguageModelV4({ doStream: async () => ({
       stream: convertArrayToReadableStream([start]),
     }) })).doStream(params);
 
@@ -170,7 +170,7 @@ describe('Redis Agent Memory provider streaming', () => {
       })
       : convertArrayToReadableStream([{ type: 'stream-start', warnings: [] }])
     }) });
-    const wrapped = forRequest(model);
+    const wrapped = requestModel(model);
     const first = await wrapped.doStream(params);
     const reader = first.stream.getReader();
     expect((await reader.read()).value).toMatchObject({ type: 'text-delta' });
@@ -189,7 +189,7 @@ describe('Redis Agent Memory provider streaming', () => {
         { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage },
       ]),
     }) });
-    const reader = (await forRequest(model).doStream(params)).stream.getReader();
+    const reader = (await requestModel(model).doStream(params)).stream.getReader();
     expect((await reader.read()).value).toMatchObject({ type: 'text-delta' });
     const pendingFinish = reader.read();
     await vi.waitFor(() => expect(http.requests.filter(({ body }) => body?.role === 'ASSISTANT')).toHaveLength(1));
@@ -211,7 +211,7 @@ describe('Redis Agent Memory provider streaming', () => {
         { type: 'text-delta', id: 'answer', delta: 'Completed answer.' }, finish,
       ]),
     }) });
-    const reader = (await forRequest(model, {
+    const reader = (await requestModel(model, {
       onDiagnostic: (event: RedisAgentMemoryDiagnostic) => diagnostics.push(event),
     }).doStream({ ...params, abortSignal: controller.signal })).stream.getReader();
     expect((await reader.read()).value).toMatchObject({ type: 'text-delta' });
@@ -239,7 +239,7 @@ describe('Redis Agent Memory provider streaming', () => {
       stream: convertArrayToReadableStream([...deltas, finish]),
     }) });
 
-    const result = await forRequest(model, {
+    const result = await requestModel(model, {
       limits: { recordingChars: 10 }, onDiagnostic: (event: RedisAgentMemoryDiagnostic) => diagnostics.push(event),
     }).doStream({ ...params, prompt: [{ role: 'user', content: [{ type: 'text', text: 'Q' }] }] });
 
@@ -261,7 +261,7 @@ describe('Redis Agent Memory provider streaming', () => {
       stream: convertArrayToReadableStream([{ type: 'text-delta', id: 'answer', delta: 'Answer.' }, finish]),
     }) });
 
-    const parts = await readAll((await forRequest(model, { includeMemoryProvenance: true }).doStream(params)).stream);
+    const parts = await readAll((await requestModel(model, { includeMemoryProvenance: true }).doStream(params)).stream);
     expect(parts.at(-1)).toEqual({
       ...finish,
       providerMetadata: {
@@ -299,7 +299,7 @@ describe('Redis Agent Memory provider streaming', () => {
         { type: 'text-delta', id: 'answer', delta: `Answer ${index + 1}.` }, finishes[index]!,
       ]) };
     } });
-    const wrapped = forRequest(model);
+    const wrapped = requestModel(model);
 
     const first = await readAll((await wrapped.doStream(params)).stream);
     const second = await readAll((await wrapped.doStream(params)).stream);
@@ -323,7 +323,7 @@ describe('Redis Agent Memory provider streaming', () => {
       stream: convertArrayToReadableStream([finish]),
     }) });
 
-    const parts = await readAll((await forRequest(model, {
+    const parts = await readAll((await requestModel(model, {
       recording: false, includeMemoryProvenance: true,
       onDiagnostic: (event: RedisAgentMemoryDiagnostic) => diagnostics.push(event),
     }).doStream(params)).stream);
@@ -353,7 +353,7 @@ describe('Redis Agent Memory provider streaming', () => {
       ];
       return { stream: convertArrayToReadableStream(parts) };
     } });
-    const memoryModel = forRequest(model);
+    const memoryModel = requestModel(model);
 
     const result = streamText({
       model: memoryModel,

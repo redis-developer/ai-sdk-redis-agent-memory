@@ -13,20 +13,51 @@ import {
   resolveAgentMemoryClient,
   type RedisAgentMemoryScope,
 } from './scoped-memory.js';
+import {
+  assertConfiguredLanguageModel,
+  createRedisAgentMemoryModel,
+  type ConfiguredLanguageModel,
+  type RedisAgentMemoryModel,
+  type RedisAgentMemoryModelOptions,
+} from './provider.js';
 export { instructions } from './instructions.js';
 export { RedisAgentMemoryToolError } from './errors.js';
+export type {
+  ConfiguredLanguageModel,
+  RedisAgentMemoryDiagnostic, RedisAgentMemoryDiagnosticError,
+  RedisAgentMemoryLimits, RedisAgentMemoryModel, RedisAgentMemoryModelOptions,
+  RedisAgentMemoryProvenance, RedisAgentMemoryProvenanceEntry,
+} from './provider.js';
 export type {
   SessionEventHook, SessionEventHookInput, SessionEventHookOptions,
   SessionHookEvent, SessionEventHookErrorContext,
 } from './session-event-hook.js';
 export type { RedisAgentMemoryScope } from './scoped-memory.js';
-export interface RedisAgentMemoryOptions {
+interface RedisAgentMemoryToolOptions {
   /** Expose deletion tools. Defaults to false. */
   allowDeletes?: boolean;
   /** Expose namespace administration tools. Defaults to false. */
   namespaceTools?: boolean;
   /** HTTP request timeout in milliseconds. Defaults to 30,000. Must be positive and finite. */
   timeoutMs?: number;
+}
+
+interface RedisAgentMemoryBaseOptions extends RedisAgentMemoryToolOptions {
+  serverUrl?: string;
+  storeId?: string;
+  apiKey?: string;
+  /** Overridable default. Derive scopes and overrides from trusted, authenticated application state. */
+  scope?: RedisAgentMemoryScope;
+}
+
+export type RedisAgentMemoryOptions<DefaultModel extends ConfiguredLanguageModel | undefined = undefined> =
+  RedisAgentMemoryBaseOptions & (undefined extends DefaultModel
+    ? { /** Optional configured AI SDK model default. Model-name strings are not accepted. */ model?: DefaultModel }
+    : { /** Configured AI SDK model default. Model-name strings are not accepted. */ model: DefaultModel });
+
+export interface RedisAgentMemoryToolsOptions {
+  /** Replaces the entire factory default scope when supplied. */
+  scope?: RedisAgentMemoryScope;
 }
 
 /** A tool map with non-enumerable helpers for scoping and application session recording. */
@@ -38,31 +69,10 @@ export type RedisAgentMemoryTools = ToolSet & {
 
 function fail(message: string): never { throw new RedisAgentMemoryToolError('INVALID_SCOPE', message); }
 
-/**
- * Build ordinary AI SDK tools backed by the official Redis SDK. All credentials stay in closures.
- * @param serverUrl Defaults to AGENT_MEMORY_URL, then the production US East endpoint.
- * @param storeId Required here or through AGENT_MEMORY_STORE_ID.
- * @param apiKey Required here or through AGENT_MEMORY_API_KEY.
- * @param scope Fixed user, session, and namespace boundaries, copied at construction.
- * @param options Deletion and namespace administration tools are disabled by default.
- */
-export function createRedisAgentMemoryTools(
-  serverUrl?: string,
-  storeId?: string,
-  apiKey?: string,
-  scope: RedisAgentMemoryScope = {},
-  options: RedisAgentMemoryOptions = {},
-): RedisAgentMemoryTools {
-  options = Object.freeze({ ...options });
-  scope = copyMemoryScope(scope, options);
-  const client = resolveAgentMemoryClient(serverUrl, storeId, apiKey, options.timeoutMs ?? 30_000);
-  return buildTools(client, scope, options);
-}
-
 function buildTools(
   client: AgentMemory,
   scope: Readonly<RedisAgentMemoryScope>,
-  options: Readonly<RedisAgentMemoryOptions>,
+  options: Readonly<RedisAgentMemoryToolOptions>,
 ): RedisAgentMemoryTools {
   const deletes = options.allowDeletes ?? false;
   const scoped = createScopedMemory(client, scope);
@@ -239,25 +249,62 @@ function buildTools(
   return tools as RedisAgentMemoryTools;
 }
 
-const RedisAgentMemoryConstructor = class RedisAgentMemory {
-  constructor(
-    serverUrl?: string,
-    storeId?: string,
-    apiKey?: string,
-    scope: RedisAgentMemoryScope = {},
-    options: RedisAgentMemoryOptions = {},
-  ) {
-    Object.defineProperties(this, Object.getOwnPropertyDescriptors(
-      createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options),
-    ));
+type ModelCallWithDefault = (options?: RedisAgentMemoryModelOptions) => RedisAgentMemoryModel;
+type ModelCallWithoutDefault = (
+  options: RedisAgentMemoryModelOptions & { model: ConfiguredLanguageModel },
+) => RedisAgentMemoryModel;
+
+export type RedisAgentMemory<DefaultModel extends ConfiguredLanguageModel | undefined = undefined> = Readonly<{
+  tools: (options?: RedisAgentMemoryToolsOptions) => RedisAgentMemoryTools;
+  model: undefined extends DefaultModel ? ModelCallWithoutDefault : ModelCallWithDefault;
+}>;
+
+/**
+ * Create one immutable Redis Agent Memory factory and share its Iris client across tools and request models.
+ * Each `model()` call returns fresh request-local state and must be reused only within one application request.
+ */
+export function createRedisAgentMemory<DefaultModel extends ConfiguredLanguageModel | undefined = undefined>(
+  input: RedisAgentMemoryOptions<DefaultModel>,
+): RedisAgentMemory<DefaultModel> {
+  const options = Object.freeze({ ...input });
+  if (options.model !== undefined) assertConfiguredLanguageModel(options.model);
+  const defaultScope = copyMemoryScope(options.scope ?? {}, options);
+  const toolOptions: Readonly<RedisAgentMemoryToolOptions> = Object.freeze({
+    allowDeletes: options.allowDeletes,
+    namespaceTools: options.namespaceTools,
+    timeoutMs: options.timeoutMs,
+  });
+  let client: ReturnType<typeof resolveAgentMemoryClient>;
+  try {
+    client = resolveAgentMemoryClient(
+      options.serverUrl,
+      options.storeId,
+      options.apiKey,
+      options.timeoutMs ?? 30_000,
+    );
+  } catch (error) {
+    throw new RedisAgentMemoryToolError(
+      'INVALID_CONFIGURATION',
+      error instanceof Error ? error.message : 'Redis Agent Memory connection configuration is invalid.',
+    );
   }
-};
-
-export type RedisAgentMemory = RedisAgentMemoryTools;
-
-// Expose the tool-map intersection at the constructor boundary so withContext remains a method, not a tool.
-/** Pass directly as `tools: new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options)`. Only tools are enumerable. */
-export const RedisAgentMemory = RedisAgentMemoryConstructor as unknown as {
-  new (...args: ConstructorParameters<typeof RedisAgentMemoryConstructor>): RedisAgentMemory;
-  readonly prototype: RedisAgentMemory;
-};
+  const defaultModel = options.model;
+  const memory = {
+    tools(callOptions: RedisAgentMemoryToolsOptions = {}) {
+      const scope = callOptions.scope === undefined
+        ? defaultScope
+        : copyMemoryScope(callOptions.scope, toolOptions);
+      return buildTools(client, scope, toolOptions);
+    },
+    model(callOptions: RedisAgentMemoryModelOptions = {}) {
+      const selectedModel = callOptions.model === undefined ? defaultModel : callOptions.model;
+      assertConfiguredLanguageModel(selectedModel);
+      const scope = callOptions.scope === undefined
+        ? defaultScope
+        : copyMemoryScope(callOptions.scope);
+      const { model: _model, ...requestOptions } = callOptions;
+      return createRedisAgentMemoryModel(client, selectedModel, { ...requestOptions, scope });
+    },
+  };
+  return Object.freeze(memory) as RedisAgentMemory<DefaultModel>;
+}

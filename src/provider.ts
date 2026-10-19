@@ -12,8 +12,9 @@ import * as s from './schemas.js';
 
 export { RedisAgentMemoryToolError } from './errors.js';
 
-type ConfiguredLanguageModel = Parameters<typeof wrapLanguageModel>[0]['model'];
-type WrappedLanguageModel = ReturnType<typeof wrapLanguageModel>;
+export type ConfiguredLanguageModel = Parameters<typeof wrapLanguageModel>[0]['model'];
+export type RedisAgentMemoryModel = ReturnType<typeof wrapLanguageModel>;
+type WrappedLanguageModel = RedisAgentMemoryModel;
 type ModelCallOptions = Parameters<WrappedLanguageModel['doGenerate']>[0];
 type ModelPrompt = ModelCallOptions['prompt'];
 type ModelGenerateResult = Awaited<ReturnType<WrappedLanguageModel['doGenerate']>>;
@@ -21,14 +22,7 @@ type ModelStreamResult = Awaited<ReturnType<WrappedLanguageModel['doStream']>>;
 type ModelStreamPart = ModelStreamResult['stream'] extends ReadableStream<infer Part> ? Part : never;
 type ProviderMetadata = ModelGenerateResult['providerMetadata'];
 
-export type RedisAgentMemoryScope = BaseScope & { userId: string };
-
-export interface RedisAgentMemoryProviderOptions {
-  model: ConfiguredLanguageModel;
-  serverUrl?: string;
-  storeId?: string;
-  apiKey?: string;
-}
+type ModelScope = BaseScope & { userId: string };
 
 export interface RedisAgentMemoryLimits {
   memoryCount?: number;
@@ -40,7 +34,10 @@ export interface RedisAgentMemoryLimits {
 }
 
 export interface RedisAgentMemoryModelOptions {
-  scope: RedisAgentMemoryScope;
+  /** Replaces the factory default scope when supplied. */
+  scope?: BaseScope;
+  /** Overrides the factory default configured model when supplied. */
+  model?: ConfiguredLanguageModel;
   assistantId?: string;
   historyMode?: 'iris' | 'application';
   recording?: boolean;
@@ -80,11 +77,6 @@ export interface RedisAgentMemoryProvenance {
   memories: RedisAgentMemoryProvenanceEntry[];
 }
 
-export interface RedisAgentMemoryProvider {
-  /** Create one model per application request; reuse it only for that request's steps and retries. */
-  forRequest(options: RedisAgentMemoryModelOptions): WrappedLanguageModel;
-}
-
 type Limits = Required<RedisAgentMemoryLimits>;
 type ReadStatus = 'success' | 'empty' | 'unavailable' | 'skipped' | 'timeout' | 'failure';
 type ReadOutcome<T> = Readonly<{ status: ReadStatus; value?: T; error?: RedisAgentMemoryToolError }>;
@@ -114,12 +106,12 @@ function providerError(code: string, message: string): RedisAgentMemoryToolError
   return new RedisAgentMemoryToolError(code, message);
 }
 
-function parseScope(scope: RedisAgentMemoryModelOptions['scope']): Readonly<RedisAgentMemoryScope> {
+function parseScope(scope: RedisAgentMemoryModelOptions['scope']): Readonly<ModelScope> {
   if (!scope || typeof scope !== 'object' || typeof scope.userId !== 'string') {
     throw providerError('INVALID_SCOPE', 'Provider scope requires a valid userId.');
   }
   try {
-    return copyMemoryScope(scope) as Readonly<RedisAgentMemoryScope>;
+    return copyMemoryScope(scope) as Readonly<ModelScope>;
   } catch {
     throw providerError('INVALID_SCOPE', 'Provider scope is invalid.');
   }
@@ -366,387 +358,384 @@ function isoTimestamp(value: unknown): string | undefined {
   return undefined;
 }
 
-/** Create an immutable provider-like factory around an already configured AI SDK model. */
-export function createRedisAgentMemoryProvider(
-  providerOptions: RedisAgentMemoryProviderOptions,
-): RedisAgentMemoryProvider {
-  const { model, ...connection } = providerOptions;
+export function assertConfiguredLanguageModel(model: unknown): asserts model is ConfiguredLanguageModel {
   if (!model || typeof model !== 'object' ||
+    !('specificationVersion' in model) || typeof model.specificationVersion !== 'string' ||
     !['v2', 'v3', 'v4'].includes(model.specificationVersion) ||
-    typeof model.provider !== 'string' || typeof model.modelId !== 'string' ||
-    typeof model.doGenerate !== 'function' || typeof model.doStream !== 'function') {
-    throw providerError('INVALID_CONFIGURATION', 'Redis Agent Memory provider requires a configured language model.');
+    !('provider' in model) || typeof model.provider !== 'string' ||
+    !('modelId' in model) || typeof model.modelId !== 'string' ||
+    !('supportedUrls' in model) || model.supportedUrls === null || typeof model.supportedUrls !== 'object' ||
+    !('doGenerate' in model) || typeof model.doGenerate !== 'function' ||
+    !('doStream' in model) || typeof model.doStream !== 'function') {
+    throw providerError('INVALID_CONFIGURATION', 'Redis Agent Memory requires a configured language model.');
   }
-  let client: ReturnType<typeof resolveAgentMemoryClient>;
-  try {
-    client = resolveAgentMemoryClient(connection.serverUrl, connection.storeId, connection.apiKey);
-  } catch {
-    throw providerError('INVALID_CONFIGURATION', 'Redis Agent Memory provider connection configuration is invalid.');
+}
+
+/** Create a fresh request-scoped model using an already shared Iris client. */
+export function createRedisAgentMemoryModel(
+  client: ReturnType<typeof resolveAgentMemoryClient>,
+  model: ConfiguredLanguageModel,
+  inputOptions: RedisAgentMemoryModelOptions,
+): RedisAgentMemoryModel {
+  assertConfiguredLanguageModel(model);
+  const options = Object.freeze({ ...inputOptions });
+  const scope = parseScope(options.scope);
+  const historyMode = options.historyMode ?? 'iris';
+  if (historyMode !== 'iris' && historyMode !== 'application') {
+    throw providerError('INVALID_CONFIGURATION', 'historyMode must be iris or application.');
   }
-
-  const provider: RedisAgentMemoryProvider = {
-    forRequest(inputOptions) {
-      const options = Object.freeze({ ...inputOptions });
-      const scope = parseScope(options.scope);
-      const historyMode = options.historyMode ?? 'iris';
-      if (historyMode !== 'iris' && historyMode !== 'application') {
-        throw providerError('INVALID_CONFIGURATION', 'historyMode must be iris or application.');
+  const recording = options.recording ?? historyMode === 'iris';
+  const limits = parseLimits(options.limits);
+  const strictReads = options.strictReads ?? false;
+  const explicitQuery = options.query;
+  if (explicitQuery !== undefined && (typeof explicitQuery !== 'string' || explicitQuery.length > MAX_QUERY_CHARS)) {
+    throw providerError('INVALID_CONFIGURATION', 'query must contain at most 50,000 UTF-16 units.');
+  }
+  if (historyMode === 'iris' && !scope.sessionId) {
+    throw providerError('INVALID_CONFIGURATION', 'Iris-managed history requires scope.sessionId.');
+  }
+  let assistantId: string | undefined;
+  if (recording) {
+    if (!scope.sessionId) throw providerError('INVALID_CONFIGURATION', 'Recording requires scope.sessionId.');
+    try { assistantId = s.id.parse(options.assistantId); }
+    catch { throw providerError('INVALID_CONFIGURATION', 'Recording requires a valid assistantId.'); }
+  }
+  const scoped = createScopedMemory(client, scope);
+  const onDiagnostic = options.onDiagnostic;
+  if (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') {
+    throw providerError('INVALID_CONFIGURATION', 'onDiagnostic must be a function.');
+  }
+  const diagnose = (event: RedisAgentMemoryDiagnostic) => {
+    const safe = Object.freeze({ ...event, error: event.error ? Object.freeze({ ...event.error }) : undefined });
+    try {
+      const result = onDiagnostic?.(safe);
+      if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+        Promise.resolve(result).catch(() => undefined);
       }
-      const recording = options.recording ?? historyMode === 'iris';
-      const limits = parseLimits(options.limits);
-      const strictReads = options.strictReads ?? false;
-      const explicitQuery = options.query;
-      if (explicitQuery !== undefined && (typeof explicitQuery !== 'string' || explicitQuery.length > MAX_QUERY_CHARS)) {
-        throw providerError('INVALID_CONFIGURATION', 'query must contain at most 50,000 UTF-16 units.');
-      }
-      if (historyMode === 'iris' && !scope.sessionId) {
-        throw providerError('INVALID_CONFIGURATION', 'Iris-managed history requires scope.sessionId.');
-      }
-      let assistantId: string | undefined;
-      if (recording) {
-        if (!scope.sessionId) throw providerError('INVALID_CONFIGURATION', 'Recording requires scope.sessionId.');
-        try { assistantId = s.id.parse(options.assistantId); }
-        catch { throw providerError('INVALID_CONFIGURATION', 'Recording requires a valid assistantId.'); }
-      }
-      const scoped = createScopedMemory(client, scope);
-      const onDiagnostic = options.onDiagnostic;
-      if (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') {
-        throw providerError('INVALID_CONFIGURATION', 'onDiagnostic must be a function.');
-      }
-      const diagnose = (event: RedisAgentMemoryDiagnostic) => {
-        const safe = Object.freeze({ ...event, error: event.error ? Object.freeze({ ...event.error }) : undefined });
-        try {
-          const result = onDiagnostic?.(safe);
-          if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
-            Promise.resolve(result).catch(() => undefined);
-          }
-        } catch { /* Diagnostics never affect inference. */ }
-      };
+    } catch { /* Diagnostics never affect inference. */ }
+  };
 
-      let initialText: string | undefined;
-      let query: string | undefined;
-      let initialized = false;
-      let snapshotPromise: Promise<Snapshot> | undefined;
-      let userWritePromise: Promise<boolean> | undefined;
-      let active = false;
-      let activeSignal: AbortSignal | undefined;
-      let activeContext: ReturnType<typeof buildContext> | undefined;
-      let assistantRecordingDisabled = false;
-      let remainingRecordingChars = limits.recordingChars;
-      let lastTimestamp = 0;
-      let writeChain = Promise.resolve();
+  let initialText: string | undefined;
+  let query: string | undefined;
+  let initialized = false;
+  let snapshotPromise: Promise<Snapshot> | undefined;
+  let userWritePromise: Promise<boolean> | undefined;
+  let active = false;
+  let activeSignal: AbortSignal | undefined;
+  let activeContext: ReturnType<typeof buildContext> | undefined;
+  let assistantRecordingDisabled = false;
+  let remainingRecordingChars = limits.recordingChars;
+  let lastTimestamp = 0;
+  let writeChain = Promise.resolve();
 
-      const timestamp = () => {
-        lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
-        return new Date(lastTimestamp).toISOString();
-      };
+  const timestamp = () => {
+    lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+    return new Date(lastTimestamp).toISOString();
+  };
 
-      const readSnapshot = (callerSignal?: AbortSignal): Promise<Snapshot> => {
-        if (snapshotPromise) return snapshotPromise;
-        snapshotPromise = (async () => {
-          throwIfCallerAborted(callerSignal);
-          const deadline = composeDeadline(callerSignal, limits.readTimeoutMs);
-          const started = Date.now();
-          const run = async <T>(
-            operation: 'session.restore' | 'memory.search',
-            task: (() => Promise<T>) | undefined,
-            scopeKind: 'session' | 'memory',
-          ): Promise<ReadOutcome<T>> => {
-            if (!task) {
-              diagnose({ operation, outcome: 'skipped', durationMs: Date.now() - started });
-              return Object.freeze({ status: 'skipped' });
-            }
-            try {
-              const value = await deadline.race(Promise.resolve().then(task));
-              const count = operation === 'memory.search'
-                ? (value as Awaited<ReturnType<ScopedMemory['searchPersonalMemories']>>).items.length
-                : (value as Awaited<ReturnType<ScopedMemory['restoreScopedSession']>>).events.length;
-              const status: ReadStatus = count === 0 ? 'empty' : 'success';
-              diagnose({ operation, outcome: status, durationMs: Date.now() - started, count });
-              return Object.freeze({ status, value });
-            } catch (error) {
-              if (callerSignal?.aborted) throw abortReason(callerSignal);
-              const invariant = translatedScopeError(error, scopeKind);
-              if (invariant) {
-                deadline.abort(invariant);
-                diagnose({ operation, outcome: 'scope_violation', durationMs: Date.now() - started,
-                  error: { code: invariant.code } });
-                throw invariant;
-              }
-              if (operation === 'session.restore' && memoryErrorStatus(error) === 404) {
-                diagnose({ operation, outcome: 'unavailable', durationMs: Date.now() - started });
-                return Object.freeze({ status: 'unavailable' });
-              }
-              const safe = sanitizeMemoryError(error);
-              const timedOut = deadline.deadlineSignal.aborted;
-              const status: ReadStatus = timedOut ? 'timeout' : 'failure';
-              diagnose({ operation, outcome: status, durationMs: Date.now() - started,
-                error: { code: safe.code, statusCode: safe.statusCode } });
-              return Object.freeze({ status, error: safe });
-            }
-          };
-          try {
-            const sessionTask = historyMode === 'iris'
-              ? () => scoped.restoreScopedSession({ signal: deadline.signal, retries: { strategy: 'none' } })
-              : undefined;
-            const searchTask = query
-              ? () => scoped.searchPersonalMemories(query!, limits.memoryCount, {
-                signal: deadline.signal, retries: { strategy: 'none' },
-              })
-              : undefined;
-            const settled = await Promise.allSettled([
-              run('session.restore', sessionTask, 'session'),
-              run('memory.search', searchTask, 'memory'),
-            ]);
-            throwIfCallerAborted(callerSignal);
-            const rejected = settled.find(result => result.status === 'rejected');
-            if (rejected?.status === 'rejected') throw rejected.reason;
-            const [session, memories] = settled.map(result => (
-              result as PromiseFulfilledResult<ReadOutcome<unknown>>
-            ).value) as [Snapshot['session'], Snapshot['memories']];
-            if (strictReads) {
-              const failed = [session, memories].find(outcome => outcome.status === 'failure' || outcome.status === 'timeout');
-              if (failed?.error) throw failed.error;
-            }
-            return Object.freeze({ session, memories });
-          } finally {
-            deadline.close();
-          }
-        })();
-        return snapshotPromise;
-      };
-
-      const writeEvent = async (
-        operation: 'session.user.write' | 'session.assistant.write',
-        role: 'USER' | 'ASSISTANT',
-        actorId: string,
-        text: string,
-        callerSignal?: AbortSignal,
-      ): Promise<{ saved: boolean; invariant?: RedisAgentMemoryToolError }> => {
-        const started = Date.now();
-        if (text.length > remainingRecordingChars) {
-          diagnose({ operation, outcome: 'too_large', durationMs: 0, writeStatus: 'not_started' });
-          return { saved: false };
+  const readSnapshot = (callerSignal?: AbortSignal): Promise<Snapshot> => {
+    if (snapshotPromise) return snapshotPromise;
+    snapshotPromise = (async () => {
+      throwIfCallerAborted(callerSignal);
+      const deadline = composeDeadline(callerSignal, limits.readTimeoutMs);
+      const started = Date.now();
+      const run = async <T>(
+        operation: 'session.restore' | 'memory.search',
+        task: (() => Promise<T>) | undefined,
+        scopeKind: 'session' | 'memory',
+      ): Promise<ReadOutcome<T>> => {
+        if (!task) {
+          diagnose({ operation, outcome: 'skipped', durationMs: Date.now() - started });
+          return Object.freeze({ status: 'skipped' });
         }
-        const deadline = composeDeadline(callerSignal, limits.writeTimeoutMs);
-        let post: 'not_started' | 'started' | 'acknowledged' = 'not_started';
         try {
-          await deadline.race(scoped.appendSessionEvent({
-            actorId, role, content: splitEventText(text), createdAt: timestamp(),
-          }, {
-            signal: deadline.signal,
-            retries: { strategy: 'none' },
-            postflightNewSession: role === 'USER',
-            validateResponse: true,
-            onPostStatus: status => { post = status; },
-          }));
-          remainingRecordingChars -= text.length;
-          diagnose({ operation, outcome: 'success', durationMs: Date.now() - started, writeStatus: 'acknowledged' });
-          return { saved: true };
+          const value = await deadline.race(Promise.resolve().then(task));
+          const count = operation === 'memory.search'
+            ? (value as Awaited<ReturnType<ScopedMemory['searchPersonalMemories']>>).items.length
+            : (value as Awaited<ReturnType<ScopedMemory['restoreScopedSession']>>).events.length;
+          const status: ReadStatus = count === 0 ? 'empty' : 'success';
+          diagnose({ operation, outcome: status, durationMs: Date.now() - started, count });
+          return Object.freeze({ status, value });
         } catch (error) {
-          if (post !== 'not_started') remainingRecordingChars -= text.length;
-          const settledPost = post as 'not_started' | 'started' | 'acknowledged';
-          const writeStatus = settledPost === 'acknowledged' ? 'acknowledged'
-            : settledPost === 'started' ? 'unknown' : 'not_started';
-          if (callerSignal?.aborted) {
-            const safe = sanitizeMemoryError(abortReason(callerSignal));
-            diagnose({ operation, outcome: 'failure', durationMs: Date.now() - started, writeStatus,
-              error: { code: safe.code, statusCode: safe.statusCode } });
-            throw abortReason(callerSignal);
-          }
-          const invariant = translatedScopeError(error, 'session');
+          if (callerSignal?.aborted) throw abortReason(callerSignal);
+          const invariant = translatedScopeError(error, scopeKind);
           if (invariant) {
-            diagnose({ operation, outcome: 'scope_violation', durationMs: Date.now() - started, writeStatus,
+            deadline.abort(invariant);
+            diagnose({ operation, outcome: 'scope_violation', durationMs: Date.now() - started,
               error: { code: invariant.code } });
-            return { saved: false, invariant };
+            throw invariant;
+          }
+          if (operation === 'session.restore' && memoryErrorStatus(error) === 404) {
+            diagnose({ operation, outcome: 'unavailable', durationMs: Date.now() - started });
+            return Object.freeze({ status: 'unavailable' });
           }
           const safe = sanitizeMemoryError(error);
-          diagnose({ operation, outcome: deadline.deadlineSignal.aborted ? 'timeout' : 'failure',
-            durationMs: Date.now() - started, writeStatus,
+          const timedOut = deadline.deadlineSignal.aborted;
+          const status: ReadStatus = timedOut ? 'timeout' : 'failure';
+          diagnose({ operation, outcome: status, durationMs: Date.now() - started,
             error: { code: safe.code, statusCode: safe.statusCode } });
-          return { saved: false };
-        } finally {
-          deadline.close();
+          return Object.freeze({ status, error: safe });
         }
       };
-
-      const ensureUser = (callerSignal?: AbortSignal) => {
-        if (userWritePromise) return userWritePromise;
-        userWritePromise = (async () => {
-          if (!recording || !initialText) {
-            diagnose({ operation: 'session.user.write', outcome: 'skipped', durationMs: 0, writeStatus: 'not_started' });
-            return false;
-          }
-          let outcome!: Awaited<ReturnType<typeof writeEvent>>;
-          writeChain = writeChain.then(async () => { outcome = await writeEvent(
-            'session.user.write', 'USER', scope.userId, initialText!, callerSignal,
-          ); });
-          await writeChain;
-          if (outcome.invariant) throw outcome.invariant;
-          return outcome.saved;
-        })();
-        return userWritePromise;
-      };
-
-      const recordAssistant = async (text: string, callerSignal?: AbortSignal) => {
-        if (!recording || assistantRecordingDisabled || !text) return;
-        if (!await ensureUser(callerSignal)) return;
-        let outcome!: Awaited<ReturnType<typeof writeEvent>>;
-        writeChain = writeChain.then(async () => { outcome = await writeEvent(
-          'session.assistant.write', 'ASSISTANT', assistantId!, text, callerSignal,
-        ); });
-        await writeChain;
-        if (outcome.invariant) assistantRecordingDisabled = true;
-      };
-
-      const mergeProvenance = (
-        providerMetadata: ProviderMetadata,
-        context: ReturnType<typeof buildContext> | undefined,
-      ): ProviderMetadata => {
-        if (!options.includeMemoryProvenance) return providerMetadata;
-        if (providerMetadata && Object.prototype.hasOwnProperty.call(providerMetadata, 'redisAgentMemory')) {
-          diagnose({ operation: 'provenance.merge', outcome: 'collision', durationMs: 0 });
-          return providerMetadata;
+      try {
+        const sessionTask = historyMode === 'iris'
+          ? () => scoped.restoreScopedSession({ signal: deadline.signal, retries: { strategy: 'none' } })
+          : undefined;
+        const searchTask = query
+          ? () => scoped.searchPersonalMemories(query!, limits.memoryCount, {
+            signal: deadline.signal, retries: { strategy: 'none' },
+          })
+          : undefined;
+        const settled = await Promise.allSettled([
+          run('session.restore', sessionTask, 'session'),
+          run('memory.search', searchTask, 'memory'),
+        ]);
+        throwIfCallerAborted(callerSignal);
+        const rejected = settled.find(result => result.status === 'rejected');
+        if (rejected?.status === 'rejected') throw rejected.reason;
+        const [session, memories] = settled.map(result => (
+          result as PromiseFulfilledResult<ReadOutcome<unknown>>
+        ).value) as [Snapshot['session'], Snapshot['memories']];
+        if (strictReads) {
+          const failed = [session, memories].find(outcome => outcome.status === 'failure' || outcome.status === 'timeout');
+          if (failed?.error) throw failed.error;
         }
-        const memories = (context?.includedMemories ?? []).map(memory => {
-          const entry: Record<string, string> = { id: memory.id };
-          if (memory.memoryType !== undefined) entry.memoryType = memory.memoryType;
-          const createdAt = isoTimestamp(memory.createdAt);
-          const updatedAt = isoTimestamp(memory.updatedAt);
-          if (createdAt !== undefined) entry.createdAt = createdAt;
-          if (updatedAt !== undefined) entry.updatedAt = updatedAt;
-          return entry;
-        });
-        diagnose({ operation: 'provenance.merge', outcome: 'success', durationMs: 0, count: memories.length });
-        return { ...(providerMetadata ?? {}), redisAgentMemory: { memories } };
-      };
+        return Object.freeze({ session, memories });
+      } finally {
+        deadline.close();
+      }
+    })();
+    return snapshotPromise;
+  };
 
-      const middleware: LanguageModelMiddleware = {
-        specificationVersion: 'v4',
-        transformParams: async ({ params }) => {
-          if (active) throw providerError('INVALID_WRAPPER_USE', 'Concurrent calls on one memory wrapper are not supported.');
-          active = true;
-          activeSignal = params.abortSignal;
-          try {
-            if (!initialized) {
-              initialText = validateInitialPrompt(params.prompt, historyMode, recording);
-              const derived = explicitQuery ?? initialText;
-              query = derived ? safeSlice(derived, MAX_QUERY_CHARS) : undefined;
-              initialized = true;
-            }
-            const snapshot = await readSnapshot(params.abortSignal);
-            if (recording) await ensureUser(params.abortSignal);
-            throwIfCallerAborted(params.abortSignal);
-            const context = buildContext(snapshot, limits);
-            activeContext = context;
-            const omittedCount = context.sessionOmitted + context.memoryOmitted;
-            diagnose({ operation: 'context.inject', outcome: omittedCount > 0 ? 'truncated' : 'success', durationMs: 0,
-              includedCount: context.historical.length + context.includedMemories.length,
-              omittedCount });
-            return { ...params, prompt: injectPrompt(params.prompt, context) };
-          } catch (error) {
-            active = false;
-            activeSignal = undefined;
-            throw error;
-          }
-        },
-        wrapGenerate: async ({ doGenerate }) => {
-          try {
-            const result = await doGenerate();
-            const text = result.content.flatMap(part => part.type === 'text' && part.text.length > 0 ? [part.text] : []).join('');
-            try { await recordAssistant(text, activeSignal); }
-            catch { /* Output already exists; cancellation or persistence failure cannot replace it. */ }
-            const providerMetadata = mergeProvenance(result.providerMetadata, activeContext);
-            return providerMetadata === result.providerMetadata ? result : { ...result, providerMetadata };
-          } finally {
-            active = false;
-            activeSignal = undefined;
-            activeContext = undefined;
-          }
-        },
-        wrapStream: async ({ doStream }) => {
-          let result: Awaited<ReturnType<typeof doStream>>;
-          try { result = await doStream(); }
-          catch (error) {
-            active = false;
-            activeSignal = undefined;
-            activeContext = undefined;
-            throw error;
-          }
-          const source = result.stream;
-          const callerSignal = activeSignal;
-          const context = activeContext;
-          const cancellation = new AbortController();
-          const recordingSignal = callerSignal
-            ? AbortSignal.any([callerSignal, cancellation.signal])
-            : cancellation.signal;
-          let reader: ReadableStreamDefaultReader<ModelStreamPart>;
-          let cancelled = false;
-          let released = false;
-          const release = () => {
-            if (released) return;
-            released = true;
-            active = false;
-            activeSignal = undefined;
-            activeContext = undefined;
-          };
-          const stream = new ReadableStream<ModelStreamPart>({
-            start(controller) {
-              reader = source.getReader();
-              void (async () => {
-                let finish: Extract<ModelStreamPart, { type: 'finish' }> | undefined;
-                let failed = false;
-                let text = '';
-                const bufferLimit = remainingRecordingChars + 1;
-                try {
-                  while (true) {
-                    const next = await reader.read();
-                    if (next.done) break;
-                    const part = next.value;
-                    if (part.type === 'finish') {
-                      finish = part;
-                      continue;
-                    }
-                    controller.enqueue(part);
-                    if (part.type === 'error') failed = true;
-                    if (part.type === 'text-delta' && text.length < bufferLimit) {
-                      text += part.delta.slice(0, bufferLimit - text.length);
-                    }
-                  }
-                  if (cancelled) return;
-                  if (!finish || failed) {
-                    controller.close();
-                    return;
-                  }
-                  if (text.length > 0) {
-                    try { await recordAssistant(text, recordingSignal); }
-                    catch { /* Raw output succeeded; persistence cancellation cannot replace it. */ }
-                  }
-                  if (cancelled) return;
-                  const providerMetadata = mergeProvenance(finish.providerMetadata, context);
-                  controller.enqueue(providerMetadata === finish.providerMetadata
-                    ? finish : { ...finish, providerMetadata });
-                  controller.close();
-                } catch (error) {
-                  if (!cancelled) controller.error(error);
-                } finally {
-                  try { reader.releaseLock(); } catch { /* Reader may already be released by cancellation. */ }
-                  release();
+  const writeEvent = async (
+    operation: 'session.user.write' | 'session.assistant.write',
+    role: 'USER' | 'ASSISTANT',
+    actorId: string,
+    text: string,
+    callerSignal?: AbortSignal,
+  ): Promise<{ saved: boolean; invariant?: RedisAgentMemoryToolError }> => {
+    const started = Date.now();
+    if (text.length > remainingRecordingChars) {
+      diagnose({ operation, outcome: 'too_large', durationMs: 0, writeStatus: 'not_started' });
+      return { saved: false };
+    }
+    const deadline = composeDeadline(callerSignal, limits.writeTimeoutMs);
+    let post: 'not_started' | 'started' | 'acknowledged' = 'not_started';
+    try {
+      await deadline.race(scoped.appendSessionEvent({
+        actorId, role, content: splitEventText(text), createdAt: timestamp(),
+      }, {
+        signal: deadline.signal,
+        retries: { strategy: 'none' },
+        postflightNewSession: role === 'USER',
+        validateResponse: true,
+        onPostStatus: status => { post = status; },
+      }));
+      remainingRecordingChars -= text.length;
+      diagnose({ operation, outcome: 'success', durationMs: Date.now() - started, writeStatus: 'acknowledged' });
+      return { saved: true };
+    } catch (error) {
+      if (post !== 'not_started') remainingRecordingChars -= text.length;
+      const settledPost = post as 'not_started' | 'started' | 'acknowledged';
+      const writeStatus = settledPost === 'acknowledged' ? 'acknowledged'
+        : settledPost === 'started' ? 'unknown' : 'not_started';
+      if (callerSignal?.aborted) {
+        const safe = sanitizeMemoryError(abortReason(callerSignal));
+        diagnose({ operation, outcome: 'failure', durationMs: Date.now() - started, writeStatus,
+          error: { code: safe.code, statusCode: safe.statusCode } });
+        throw abortReason(callerSignal);
+      }
+      const invariant = translatedScopeError(error, 'session');
+      if (invariant) {
+        diagnose({ operation, outcome: 'scope_violation', durationMs: Date.now() - started, writeStatus,
+          error: { code: invariant.code } });
+        return { saved: false, invariant };
+      }
+      const safe = sanitizeMemoryError(error);
+      diagnose({ operation, outcome: deadline.deadlineSignal.aborted ? 'timeout' : 'failure',
+        durationMs: Date.now() - started, writeStatus,
+        error: { code: safe.code, statusCode: safe.statusCode } });
+      return { saved: false };
+    } finally {
+      deadline.close();
+    }
+  };
+
+  const ensureUser = (callerSignal?: AbortSignal) => {
+    if (userWritePromise) return userWritePromise;
+    userWritePromise = (async () => {
+      if (!recording || !initialText) {
+        diagnose({ operation: 'session.user.write', outcome: 'skipped', durationMs: 0, writeStatus: 'not_started' });
+        return false;
+      }
+      let outcome!: Awaited<ReturnType<typeof writeEvent>>;
+      writeChain = writeChain.then(async () => { outcome = await writeEvent(
+        'session.user.write', 'USER', scope.userId, initialText!, callerSignal,
+      ); });
+      await writeChain;
+      if (outcome.invariant) throw outcome.invariant;
+      return outcome.saved;
+    })();
+    return userWritePromise;
+  };
+
+  const recordAssistant = async (text: string, callerSignal?: AbortSignal) => {
+    if (!recording || assistantRecordingDisabled || !text) return;
+    if (!await ensureUser(callerSignal)) return;
+    let outcome!: Awaited<ReturnType<typeof writeEvent>>;
+    writeChain = writeChain.then(async () => { outcome = await writeEvent(
+      'session.assistant.write', 'ASSISTANT', assistantId!, text, callerSignal,
+    ); });
+    await writeChain;
+    if (outcome.invariant) assistantRecordingDisabled = true;
+  };
+
+  const mergeProvenance = (
+    providerMetadata: ProviderMetadata,
+    context: ReturnType<typeof buildContext> | undefined,
+  ): ProviderMetadata => {
+    if (!options.includeMemoryProvenance) return providerMetadata;
+    if (providerMetadata && Object.prototype.hasOwnProperty.call(providerMetadata, 'redisAgentMemory')) {
+      diagnose({ operation: 'provenance.merge', outcome: 'collision', durationMs: 0 });
+      return providerMetadata;
+    }
+    const memories = (context?.includedMemories ?? []).map(memory => {
+      const entry: Record<string, string> = { id: memory.id };
+      if (memory.memoryType !== undefined) entry.memoryType = memory.memoryType;
+      const createdAt = isoTimestamp(memory.createdAt);
+      const updatedAt = isoTimestamp(memory.updatedAt);
+      if (createdAt !== undefined) entry.createdAt = createdAt;
+      if (updatedAt !== undefined) entry.updatedAt = updatedAt;
+      return entry;
+    });
+    diagnose({ operation: 'provenance.merge', outcome: 'success', durationMs: 0, count: memories.length });
+    return { ...(providerMetadata ?? {}), redisAgentMemory: { memories } };
+  };
+
+  const middleware: LanguageModelMiddleware = {
+    specificationVersion: 'v4',
+    transformParams: async ({ params }) => {
+      if (active) throw providerError('INVALID_WRAPPER_USE', 'Concurrent calls on one memory wrapper are not supported.');
+      active = true;
+      activeSignal = params.abortSignal;
+      try {
+        if (!initialized) {
+          initialText = validateInitialPrompt(params.prompt, historyMode, recording);
+          const derived = explicitQuery ?? initialText;
+          query = derived ? safeSlice(derived, MAX_QUERY_CHARS) : undefined;
+          initialized = true;
+        }
+        const snapshot = await readSnapshot(params.abortSignal);
+        if (recording) await ensureUser(params.abortSignal);
+        throwIfCallerAborted(params.abortSignal);
+        const context = buildContext(snapshot, limits);
+        activeContext = context;
+        const omittedCount = context.sessionOmitted + context.memoryOmitted;
+        diagnose({ operation: 'context.inject', outcome: omittedCount > 0 ? 'truncated' : 'success', durationMs: 0,
+          includedCount: context.historical.length + context.includedMemories.length,
+          omittedCount });
+        return { ...params, prompt: injectPrompt(params.prompt, context) };
+      } catch (error) {
+        active = false;
+        activeSignal = undefined;
+        throw error;
+      }
+    },
+    wrapGenerate: async ({ doGenerate }) => {
+      try {
+        const result = await doGenerate();
+        const text = result.content.flatMap(part => part.type === 'text' && part.text.length > 0 ? [part.text] : []).join('');
+        try { await recordAssistant(text, activeSignal); }
+        catch { /* Output already exists; cancellation or persistence failure cannot replace it. */ }
+        const providerMetadata = mergeProvenance(result.providerMetadata, activeContext);
+        return providerMetadata === result.providerMetadata ? result : { ...result, providerMetadata };
+      } finally {
+        active = false;
+        activeSignal = undefined;
+        activeContext = undefined;
+      }
+    },
+    wrapStream: async ({ doStream }) => {
+      let result: Awaited<ReturnType<typeof doStream>>;
+      try { result = await doStream(); }
+      catch (error) {
+        active = false;
+        activeSignal = undefined;
+        activeContext = undefined;
+        throw error;
+      }
+      const source = result.stream;
+      const callerSignal = activeSignal;
+      const context = activeContext;
+      const cancellation = new AbortController();
+      const recordingSignal = callerSignal
+        ? AbortSignal.any([callerSignal, cancellation.signal])
+        : cancellation.signal;
+      let reader: ReadableStreamDefaultReader<ModelStreamPart>;
+      let cancelled = false;
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        active = false;
+        activeSignal = undefined;
+        activeContext = undefined;
+      };
+      const stream = new ReadableStream<ModelStreamPart>({
+        start(controller) {
+          reader = source.getReader();
+          void (async () => {
+            let finish: Extract<ModelStreamPart, { type: 'finish' }> | undefined;
+            let failed = false;
+            let text = '';
+            const bufferLimit = remainingRecordingChars + 1;
+            try {
+              while (true) {
+                const next = await reader.read();
+                if (next.done) break;
+                const part = next.value;
+                if (part.type === 'finish') {
+                  finish = part;
+                  continue;
                 }
-              })();
-            },
-            async cancel(reason) {
-              cancelled = true;
-              cancellation.abort(reason ?? new DOMException('Stream cancelled.', 'AbortError'));
+                controller.enqueue(part);
+                if (part.type === 'error') failed = true;
+                if (part.type === 'text-delta' && text.length < bufferLimit) {
+                  text += part.delta.slice(0, bufferLimit - text.length);
+                }
+              }
+              if (cancelled) return;
+              if (!finish || failed) {
+                controller.close();
+                return;
+              }
+              if (text.length > 0) {
+                try { await recordAssistant(text, recordingSignal); }
+                catch { /* Raw output succeeded; persistence cancellation cannot replace it. */ }
+              }
+              if (cancelled) return;
+              const providerMetadata = mergeProvenance(finish.providerMetadata, context);
+              controller.enqueue(providerMetadata === finish.providerMetadata
+                ? finish : { ...finish, providerMetadata });
+              controller.close();
+            } catch (error) {
+              if (!cancelled) controller.error(error);
+            } finally {
+              try { reader.releaseLock(); } catch { /* Reader may already be released by cancellation. */ }
               release();
-              try { await reader?.cancel(reason); } catch { /* Preserve cancellation rather than source cleanup errors. */ }
-            },
-          });
-          return { ...result, stream };
+            }
+          })();
         },
-      };
-      return wrapLanguageModel({ model, middleware });
+        async cancel(reason) {
+          cancelled = true;
+          cancellation.abort(reason ?? new DOMException('Stream cancelled.', 'AbortError'));
+          release();
+          try { await reader?.cancel(reason); } catch { /* Preserve cancellation rather than source cleanup errors. */ }
+        },
+      });
+      return { ...result, stream };
     },
   };
-  return Object.freeze(provider);
+  return wrapLanguageModel({ model, middleware });
 }

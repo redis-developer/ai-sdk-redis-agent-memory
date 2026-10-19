@@ -1,44 +1,58 @@
 # Iris memory model wrapper plan
 
-Status: implemented in [PR #2](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/2), with the Anthropic demo in stacked [PR #3](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/3). Updated 2026-10-08 to reflect the reusable factory and request-scoped model API. This document describes the delivered design; deferred features are not authorized by it.
+Status: implemented in [PR #2](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/2), with the automatic-memory Anthropic demo in stacked [PR #3](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/3). Updated 2026-10-19 for the unified root factory. This document describes the delivered design; deferred features are not authorized by it.
 
 ## Purpose
 
-Add an independent AI SDK model integration that restores Iris session context and retrieves relevant long-term memories automatically before inference. The default experience is to pick up where the conversation left off. Applications pass the wrapped model to ordinary AI SDK APIs; the model does not have to choose a memory tool. Iris-managed mode records session events by default to feed both future session restoration and Iris background extraction for cross-session recall; applications can explicitly disable recording.
+Provide one Redis Agent Memory factory with two independent products: explicit AI
+SDK memory tools, and an automatic-memory model wrapper that restores Iris session
+context and retrieves relevant long-term memories before inference. Tools work
+without a configured model. The model wrapper works without constructing a
+toolset, executing a tool, or installing lifecycle hooks.
 
-Existing memory tools remain supported and unchanged. The wrapper must work without constructing a toolset, executing a tool, or installing application lifecycle hooks.
+Iris-managed model mode records session events by default for future restoration
+and Iris background extraction; applications can explicitly disable recording.
 
 ## Integration boundary
 
-- Configure an underlying language model and Iris connection once in `createRedisAgentMemoryProvider({ model, serverUrl, storeId, apiKey })`. `model` is required and accepts the configured-model type used by AI SDK `wrapLanguageModel` (V2, V3, or V4), not a provider/model string ID.
+- Publish `createRedisAgentMemory` from the package root as the only factory. It accepts `{ serverUrl?, storeId?, apiKey?, scope?, model?, allowDeletes?, namespaceTools?, timeoutMs? }`; the model is an optional configured AI SDK model, never a provider/model string.
+- Expose `memory.tools({ scope? })` and `memory.model({ scope?, model?, ...modelOptions })`. Tools never require a model. A model must resolve from the call or factory and invalid/missing models fail synchronously before network calls.
+- Factory `scope` and `model` are defaults. Omitted or `undefined` call options fall back to them. A defined call-level scope replaces the entire factory scope; it is not field-merged. A defined model replaces the default model for that result. Construction and calls do not mutate inputs, factory state, or previous results.
+- Factory scope is trusted application configuration, not an authorization ceiling. Applications derive both defaults and overrides from authenticated state. Existing scope validation and ownership/namespace enforcement apply after default resolution.
+- Retain returned-toolset `withContext(scope)` as a non-mutating narrowing helper, distinct from factory-default replacement. Retain `createSessionEventHook(options)` and all tool behavior.
 - Use AI SDK model middleware internally, targeting the repository's AI SDK 7 contract. Support `generateText`, `streamText`, and tool-loop agents.
-- Publish `createRedisAgentMemoryProvider`, `RedisAgentMemoryProvider`, and related declarations through the independent `ai-sdk-redis-agent-memory/provider` entry point. Existing root tools and hooks remain compatible.
-- Bind the store/connection at factory creation and copy immutable authenticated `userId` and request scope in `memory.forRequest(options)`. Require `sessionId` in default Iris-managed history mode or whenever recording is enabled, and a valid `assistantId` whenever recording is enabled. Never infer identity or widen scope from prompt content.
-- Create a fresh request model with `memory.forRequest(options)` for each application request. Reuse that result across the request's tool-loop steps and retries, never across independent requests. One factory shares its configured underlying model and Iris client, but no mutable request state. Factory and request-model construction make no network calls. Overlapping calls on one request model are rejected with `INVALID_WRAPPER_USE`; separate request models can run concurrently for distinct sessions.
-- Require the application to globally serialize independent requests by exact session ID: one active application request per session, even if callers claim different users. Different sessions can run concurrently. Do not introduce distributed locking or promise cross-request ordering the wrapper cannot enforce.
-- Read personal long-term memories only in v1, across sessions within the configured scope. Restore working context only from the specified session, with ownership and scope validation.
+- Bind the store/connection at factory creation and resolve immutable authenticated `userId` and request scope in `memory.model(options)`. Require `sessionId` in default Iris-managed history mode or whenever recording is enabled, and a valid `assistantId` whenever recording is enabled. Never infer identity or widen scope from prompt content.
+- Create a fresh request model with `memory.model(options)` for each application request. Reuse it across that request's tool-loop steps and retries, never across independent requests. One factory shares its configured underlying model, when present, and Iris client, but no mutable request state. Factory, tools, and model construction make no network calls. Overlapping calls on one request model are rejected with `INVALID_WRAPPER_USE`; separate request models can run concurrently.
+- Require the application to globally serialize independent requests by exact session ID. Different sessions can run concurrently. Do not introduce distributed locking or promise cross-request ordering the wrapper cannot enforce.
+- Read personal long-term memories only in v1, across sessions within configured scope. Restore working context only from the specified session, with ownership and scope validation.
 
-AI SDK documents RAG through `transformParams`, while provider factories can compose wrapped models. Middleware observes individual model calls, not complete application turns. [Middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), [provider management](https://ai-sdk.dev/docs/ai-sdk-core/provider-management), [tool loops](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling).
+The unreleased `RedisAgentMemory` class, `createRedisAgentMemoryTools`,
+`createRedisAgentMemoryProvider`, provider object and `forRequest`, separate
+`./provider` public entry point, and earlier `wrap` surface are intentionally
+removed rather than retained as compatibility aliases. Related model option,
+diagnostic, limit, and provenance types are exported from the package root.
+
+AI SDK documents RAG through `transformParams`, while factories can compose wrapped models. Middleware observes individual model calls, not complete application turns. [Middleware](https://ai-sdk.dev/docs/ai-sdk-core/middleware), [provider management](https://ai-sdk.dev/docs/ai-sdk-core/provider-management), [tool loops](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling).
 
 ## Public API and request ownership
 
 ```ts
 import { anthropic } from '@ai-sdk/anthropic';
 import { ToolLoopAgent, isStepCount } from 'ai';
-import { createRedisAgentMemoryProvider } from 'ai-sdk-redis-agent-memory/provider';
+import { createRedisAgentMemory } from 'ai-sdk-redis-agent-memory';
 
-// Application configuration: shared across requests.
-const memory = createRedisAgentMemoryProvider({
+const memory = createRedisAgentMemory({
   serverUrl: process.env.AGENT_MEMORY_URL,
   storeId: process.env.AGENT_MEMORY_STORE_ID,
   apiKey: process.env.AGENT_MEMORY_API_KEY,
-  model: anthropic('claude-sonnet-4-5'),
+  model: anthropic('claude-sonnet-4-5'), // optional when only tools are needed
 });
 
-// Inside each application request; IDs come from authenticated application state.
+const tools = memory.tools({ scope: { userId, sessionId } });
+
 async function reply(userId: string, sessionId: string, prompt: string) {
   const agent = new ToolLoopAgent({
-    model: memory.forRequest({
+    model: memory.model({
       scope: { userId, sessionId },
       assistantId: 'assistant',
     }),
@@ -48,29 +62,22 @@ async function reply(userId: string, sessionId: string, prompt: string) {
 }
 ```
 
-`RedisAgentMemoryProviderOptions.model` is required. The factory returns an
-immutable `RedisAgentMemoryProvider` exposing only
-`forRequest(options: RedisAgentMemoryModelOptions)`. This intentionally replaces
-the unreleased `wrap(model, options)` API; there is no compatibility alias.
-Invalid configured models and connection settings fail at factory construction.
-
-Per-request options remain `scope`, `assistantId`, `historyMode`, `recording`,
+Model options are `scope`, `model`, `assistantId`, `historyMode`, `recording`,
 `query`, `strictReads`, `includeMemoryProvenance`, `limits`, and `onDiagnostic`.
-Each `forRequest()` validates/copies its options and returns an AI SDK V4-compatible
-wrapped model. The factory itself is not a language model: passing `model: memory`
-to a singleton agent is unsupported. Automatic agent-level request lifecycle
-integration remains outside this change.
+Each `memory.model()` validates and copies its resolved options and returns an AI
+SDK V4-compatible wrapped model. The factory itself is not a language model;
+passing `model: memory` to a singleton agent is unsupported.
 
 | Lifetime | Owned state |
 | --- | --- |
-| Reusable factory | Configured underlying model and resolved Iris client/connection |
-| Each request model | Copied scope and options; initial USER text and query; cached restoration/recall snapshot; single USER-write attempt; remaining recording budget and assistant-recording invariant latch; active-call/cancellation state; monotonic timestamps and write sequencing |
+| Reusable factory | Iris client/connection; copied optional scope and configured-model defaults; tool feature configuration |
+| Each toolset | Resolved copied scope and non-enumerable narrowing/hook helpers |
+| Each request model | Resolved configured model; copied scope/options; initial USER text and query; cached restoration/recall snapshot; single USER-write attempt; recording budget and invariant latch; active-call/cancellation state; monotonic timestamps and write sequencing |
 
 Reads and recording begin only on model invocation. The first invocation captures
 one bounded snapshot and USER attempt; subsequent steps/retries reuse them. A new
-request performs fresh reads and records its own current USER input, even when its
-model was constructed before an earlier request completed. Request-local state is
-not a cross-request cache, session lock, or exactly-once delivery mechanism.
+request performs fresh reads and records its own current USER input. Request-local
+state is not a cross-request cache, session lock, or exactly-once mechanism.
 
 ## Retrieval and context
 
@@ -146,13 +153,22 @@ This adopts Mem0's useful programmatic source-attribution pattern while making e
 
 1. Regression tests lock existing tool/hook ownership, namespace isolation, and recording behavior.
 2. `src/scoped-memory.ts` provides the shared tool-independent client, validation, and scoped-operation seam without executing tool handlers or adding dependencies.
-3. `src/provider.ts` implements the reusable configured factory and isolated request models, default session restoration, application-managed opt-out, and bounded context injection for generation and streaming.
+3. `src/provider.ts` implements isolated request models, default session restoration, application-managed opt-out, and bounded context injection; the root factory composes it with the existing tools implementation.
 4. Each request model owns USER-write state and per-successful-step assistant recording, with retry, cancellation, ownership, budget, and sequencing safeguards.
-5. The independent package export, optional provenance, README examples, current design/roadmap, and packed-consumer checks document and validate the public API. Existing tools/hooks are unchanged; the unreleased `wrap()` API is intentionally replaced.
+5. The root package export, optional provenance, README examples, current design/roadmap, and packed-consumer checks cover the unified public API. Tool and hook capabilities remain available through `memory.tools()`; superseded unreleased APIs are removed.
 6. Focused tests and `npm run check` cover typechecking, tests, build, and packed-package consumer validation. There is no standalone lint script.
 
-## Acceptance criteria and verified evidence
+## Acceptance criteria
 
+- Factory defaults and defined per-call overrides select the expected scope and
+  model for both products. `undefined` falls back; a defined scope replaces the
+  entire default, including removal of omitted session and namespace fields.
+- Factory inputs, call inputs, the factory, and earlier tool/model results remain
+  unchanged after later calls and concurrent use.
+- Tools construct and run without any configured model. Model creation selects a
+  configured factory or call model and synchronously rejects missing, string, or
+  malformed models before network access.
+- Factory, toolset, and request-model construction perform no network calls.
 - A model without memory tools receives scoped Iris context before inference in both generate and stream paths.
 - Default Iris-managed mode resumes the same session on a fresh wrapper using available summary and recent events. Application-managed mode makes no session-history read. Both modes validate required identity and preserve current application instructions.
 - Restoration precedes the user-event write. Restored history, the new user message, and later tool-loop messages are each included once; incompatible supplied history is not silently merged.
@@ -165,32 +181,33 @@ This adopts Mem0's useful programmatic source-attribution pattern while making e
 - Each successful assistant step records only generated text. Tests cover text-only, mixed text/tool responses, tool-only responses, reasoning parts, stream errors, cancellation, and raw completion without downstream consumption.
 - Streaming preserves provider chunks and non-text events while awaiting only bounded end-of-stream persistence.
 - Provenance is absent by default. Opt-in generate and stream tests expose only included, in-scope memory IDs and allowlisted metadata, preserve existing provider metadata, and exclude raw text and arbitrary stored metadata. Provenance requires no additional memory calls.
-- Existing tool and lifecycle-hook tests still pass. Packed ESM consumers construct the new factory and request models without network calls and reject missing/string/malformed models. NodeNext and Bundler consumers accept configured models and reject missing/string/optional-undefined/malformed models and the removed `wrap()` API; the result is assignable to a `ToolLoopAgent` model.
+- Existing tool and lifecycle-hook behavior remains covered. Packed ESM,
+  NodeNext, and Bundler consumers use only the root factory, accept valid
+  configured models, reject invalid/defaultless model calls and removed APIs,
+  and accept the result as a `ToolLoopAgent` model.
+- The final runnable layout is `demo/tools/` plus `demo/provider/`. Both retain
+  their independent installation, startup, local-package resolution, and mocked
+  behavior tests; obsolete flat `demo/` application paths and `demo2/` are gone.
 - No live Iris or inference calls are required for automated tests; any later live validation requires its own credentials and authorization.
 - Usage documentation and examples require application-owned per-session serialization and clearly disclose default recording in Iris-managed mode, the recording opt-out, and inclusion of intermediate assistant text. No distributed-lock, final-answer-only, or complete-transcript guarantee is claimed.
 
-### Validation recorded for the API revision
+### Historical validation before the unified-factory migration
 
-- Test-first request-model and invalid-model regression tests failed against the
-  old API/validation before implementation; packed ESM checks rejected the old
-  `wrap` surface before migration.
-- `npm run check`: **182 library tests across 8 suites passed**, plus typecheck,
-  build, tarball inspection, ESM runtime consumers, and NodeNext/Bundler declaration
-  consumers.
+The following results were recorded for the preceding provider-factory revision.
+They validate the underlying request-model behavior, not the later unified API or
+demo relocation; current change validation belongs in the PR checks and final
+implementation report.
+
+- `npm run check` passed **182 library tests across 8 suites**, plus typecheck,
+  build, tarball inspection, ESM runtime consumers, and NodeNext/Bundler
+  declaration consumers.
 - `tsc --noEmit --noUnusedLocals --noUnusedParameters`, JavaScript syntax checks,
-  and `git diff --check` passed. No standalone lint script is configured.
-- The stacked Anthropic `demo2` configures `anthropic(modelName)` once and calls
-  `memory.forRequest()` inside its serial chat loop for every turn. It retains the
-  session across turns, changes it with `/new`, and resumes via `DEMO_SESSION_ID`.
-  `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, and default `claude-sonnet-4-5` are
-  unchanged. There are no memory tools, recording hooks, or local history array.
-- **10 mocked demo2 tests** and **17 original-demo tests** passed, including fresh
-  request state after a failed turn, continuity/resume, model override, scope
-  enforcement, sanitized diagnostics, and zero-network configuration/commands.
-  The original `demo/` remains unchanged.
-- Node.js **22 and 24 CI passed for both PRs** for the API revision. All automated
-  service calls were mocked; package checks accessed npm only for existing
-  consumer dependencies. No dependencies were added.
+  and `git diff --check` passed. No standalone lint script was configured.
+- The then-stacked `demo2` passed **10 mocked tests**, and the then-flat tools
+  `demo/` passed **17 mocked tests**. Those paths and old provider-factory calls
+  are historical; the final layout is `demo/tools/` plus `demo/provider/`.
+- Node.js **22 and 24 CI** passed for both PRs at that revision. All service calls
+  were mocked and no dependencies were added.
 
 ## Deferred scope
 

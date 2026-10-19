@@ -7,10 +7,10 @@ import {
 import { generateText } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import {
-  createRedisAgentMemoryProvider,
+  createRedisAgentMemory,
   RedisAgentMemoryToolError,
   type RedisAgentMemoryDiagnostic,
-} from '../src/provider.js';
+} from '../src/index.js';
 
 const serverUrl = 'https://provider.example.test';
 const timestamp = '2026-10-07T12:00:00.000Z';
@@ -87,18 +87,18 @@ function statefulTransport(options: {
 }
 
 function provider(model: MockLanguageModelV4) {
-  return createRedisAgentMemoryProvider({ serverUrl, storeId: 'store-1', apiKey: 'secret-key', model });
+  return createRedisAgentMemory({ serverUrl, storeId: 'store-1', apiKey: 'secret-key', model });
 }
 
-describe('Redis Agent Memory provider', () => {
-  it('returns a frozen provider with only forRequest and constructs request models without network calls', () => {
+describe('Redis Agent Memory model', () => {
+  it('returns a frozen unified factory and constructs request models without network calls', () => {
     const http = statefulTransport();
     const options = { serverUrl, storeId: 'store-1', apiKey: 'secret-key', model: new MockLanguageModelV4() };
-    const created = createRedisAgentMemoryProvider(options);
+    const created = createRedisAgentMemory(options);
     options.serverUrl = 'https://changed.example.test';
     expect(Object.isFrozen(created)).toBe(true);
-    expect(Object.keys(created)).toEqual(['forRequest']);
-    created.forRequest({ scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1' });
+    expect(Object.keys(created)).toEqual(['tools', 'model']);
+    created.model({ scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1' });
     expect(http.fetch).not.toHaveBeenCalled();
     expect(JSON.stringify(created)).not.toContain('secret-key');
   });
@@ -109,13 +109,13 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'OK' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
     const options = { serverUrl, storeId: 'store-1', apiKey: 'secret-key', model: base };
-    const memory = createRedisAgentMemoryProvider(options);
+    const memory = createRedisAgentMemory(options);
     options.model = new MockLanguageModelV4();
     options.serverUrl = 'https://changed.example.test';
     options.storeId = 'changed-store';
     options.apiKey = 'changed-key';
     for (const userId of ['user-1', 'user-2']) {
-      await memory.forRequest({ scope: { userId }, historyMode: 'application' }).doGenerate(call([
+      await memory.model({ scope: { userId }, historyMode: 'application' }).doGenerate(call([
         { role: 'user', content: [{ type: 'text', text: 'Q' }] },
       ]));
     }
@@ -129,10 +129,10 @@ describe('Redis Agent Memory provider', () => {
     }
   });
 
-  it.each([undefined, null, 'provider:model', {}, { specificationVersion: 'v4' }])(
+  it.each([null, 'provider:model', {}, { specificationVersion: 'v4' }])(
     'rejects an invalid configured model at factory construction: %j', model => {
       const http = statefulTransport();
-      expect(() => createRedisAgentMemoryProvider({
+      expect(() => createRedisAgentMemory({
         serverUrl, storeId: 'store-1', apiKey: 'secret-key',
         // @ts-expect-error Exercise invalid JavaScript consumer input.
         model,
@@ -142,7 +142,7 @@ describe('Redis Agent Memory provider', () => {
   );
 
   it('reports invalid provider connection configuration as a stable safe error', () => {
-    expect(() => createRedisAgentMemoryProvider({
+    expect(() => createRedisAgentMemory({
       serverUrl: 'https://user:password@example.test', storeId: 'store-1', apiKey: 'secret-key', model: new MockLanguageModelV4(),
     })).toThrow(expect.objectContaining({ name: 'IrisToolError', code: 'INVALID_CONFIGURATION' }));
   });
@@ -163,11 +163,11 @@ describe('Redis Agent Memory provider', () => {
     const options = { scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1' };
 
     const memory = provider(base);
-    await memory.forRequest(options).doGenerate(call([
+    await memory.model(options).doGenerate(call([
       { role: 'system', content: 'Application rule.' },
       { role: 'user', content: [{ type: 'text', text: 'First question.' }] },
     ]));
-    await memory.forRequest(options).doGenerate(call([
+    await memory.model(options).doGenerate(call([
       { role: 'system', content: 'Application rule.' },
       { role: 'user', content: [{ type: 'text', text: 'Continue.' }] },
     ]));
@@ -198,8 +198,8 @@ describe('Redis Agent Memory provider', () => {
     const memory = provider(base);
     const options = { scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { recordingChars: 3 } };
-    const first = memory.forRequest(options);
-    const second = memory.forRequest(options);
+    const first = memory.model(options);
+    const second = memory.model(options);
     const params = call([{ role: 'user', content: [{ type: 'text', text: 'Q' }] }]);
     await first.doGenerate(params);
     memories.splice(0, 1, { id: 'new', text: 'NEW SNAPSHOT', ownerId: 'user-1', createdAt: timestamp, updatedAt: timestamp });
@@ -237,7 +237,7 @@ describe('Redis Agent Memory provider', () => {
     const requests = [1, 2].map(id => {
       const options = { scope: { userId: `user-${id}`, sessionId: `session-${id}` },
         assistantId: `assistant-${id}`, query: `query-${id}`, limits: { recordingChars: 3 } };
-      const model = memory.forRequest(options);
+      const model = memory.model(options);
       options.scope.userId = 'mutated-user';
       options.scope.sessionId = 'mutated-session';
       options.query = 'mutated-query';
@@ -270,7 +270,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'reasoning', text: 'private reasoning' }, { type: 'text', text: 'Visible step.' }],
       finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    const wrapped = provider(base).forRequest({
+    const wrapped = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     });
     const params = call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]);
@@ -290,7 +290,7 @@ describe('Redis Agent Memory provider', () => {
   it('rejects foreign restored ownership before inference even in fail-open mode', async () => {
     statefulTransport({ ownerId: 'another-user' });
     const model = new MockLanguageModelV4();
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1', recording: false,
     });
 
@@ -307,7 +307,7 @@ describe('Redis Agent Memory provider', () => {
       return Response.json({ sessionId: 'session-2', ownerId: 'user-1', events: [] });
     }));
     const model = new MockLanguageModelV4();
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1', recording: false,
     });
 
@@ -322,7 +322,7 @@ describe('Redis Agent Memory provider', () => {
     const http = statefulTransport({ ignoreSessionReads: true });
     const diagnostics: RedisAgentMemoryDiagnostic[] = [];
     const model = new MockLanguageModelV4();
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { readTimeoutMs: 25 }, strictReads: true, onDiagnostic: event => diagnostics.push(event),
     });
@@ -347,7 +347,7 @@ describe('Redis Agent Memory provider', () => {
       return new Promise<Response>(() => {});
     }));
     const model = new MockLanguageModelV4();
-    const result = provider(model).forRequest({
+    const result = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false, strictReads: true,
       limits: { readTimeoutMs: 25 },
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
@@ -377,7 +377,7 @@ describe('Redis Agent Memory provider', () => {
       return { content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' },
         usage, warnings: [] };
     } });
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false,
       includeMemoryProvenance: true, limits: { readTimeoutMs: 25 },
     });
@@ -413,7 +413,7 @@ describe('Redis Agent Memory provider', () => {
     const model = new MockLanguageModelV4({ doGenerate: async () => ({
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false, limits: { readTimeoutMs: 25 },
     });
     const first = wrapped.doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
@@ -437,7 +437,7 @@ describe('Redis Agent Memory provider', () => {
     }));
     const model = new MockLanguageModelV4();
 
-    await expect(provider(model).forRequest({
+    await expect(provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false, strictReads: true,
     }).doGenerate(call([
       { role: 'user', content: [{ type: 'text', text: 'Question.' }] },
@@ -455,7 +455,7 @@ describe('Redis Agent Memory provider', () => {
       { role: 'user', content: [{ type: 'text', text: 'Earlier question.' }] },
       { role: 'assistant', content: [{ type: 'text', text: 'Earlier answer.' }] },
     ];
-    const result = await provider(base).forRequest({
+    const result = await provider(base).model({
       historyMode: 'application', scope: { userId: 'user-1' },
     }).doGenerate(call(prompt));
 
@@ -470,16 +470,16 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
     const exact = 'q'.repeat(50_000);
-    await provider(model).forRequest({
+    await provider(model).model({
       historyMode: 'application', recording: false, scope: { userId: 'user-1' }, query: exact,
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Prompt.' }] }]));
     expect(http.requests.at(-1)?.body).toMatchObject({ text: exact });
-    expect(() => provider(model).forRequest({
+    expect(() => provider(model).model({
       historyMode: 'application', recording: false, scope: { userId: 'user-1' }, query: `${exact}x`,
     })).toThrow(expect.objectContaining({ code: 'INVALID_CONFIGURATION' }));
 
     const derived = `${'x'.repeat(49_999)}😀tail`;
-    await provider(model).forRequest({
+    await provider(model).model({
       historyMode: 'application', recording: false, scope: { userId: 'user-1' },
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: derived }] }]));
     expect(http.requests.at(-1)?.body).toMatchObject({ text: 'x'.repeat(49_999) });
@@ -528,7 +528,7 @@ describe('Redis Agent Memory provider', () => {
       { role: 'user', content: [{ type: 'text', text: 'Current.' }] },
     ];
 
-    await provider(base).forRequest({
+    await provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false,
       limits: { sessionChars: summarySection.length + newestRecord.length, memoryChars },
       onDiagnostic: event => diagnostics.push(event),
@@ -563,9 +563,9 @@ describe('Redis Agent Memory provider', () => {
         usage, warnings: [] };
     } });
     const baseOptions = { historyMode: 'application' as const, recording: false, scope: { userId: 'user-1' } };
-    await provider(model).forRequest({ ...baseOptions, limits: { memoryChars: exact } })
+    await provider(model).model({ ...baseOptions, limits: { memoryChars: exact } })
       .doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
-    await provider(model).forRequest({ ...baseOptions, limits: { memoryChars: exact - 1 } })
+    await provider(model).model({ ...baseOptions, limits: { memoryChars: exact - 1 } })
       .doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
 
     const included = (prompts[0]![0] as { content: string }).content;
@@ -582,7 +582,7 @@ describe('Redis Agent Memory provider', () => {
     const prompt = [{ role: 'user' as const, content: [{
       type: 'file' as const, mediaType: 'image/png', data: { type: 'data' as const, data: 'aGVsbG8=' },
     }] }];
-    await provider(model).forRequest({
+    await provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     }).doGenerate(call(prompt));
 
@@ -594,8 +594,8 @@ describe('Redis Agent Memory provider', () => {
   it('validates conditional identities and initial Iris history before HTTP or model calls', async () => {
     const http = statefulTransport();
     const model = new MockLanguageModelV4();
-    expect(() => provider(model).forRequest({ scope: { userId: 'user-1' } })).toThrowError(RedisAgentMemoryToolError);
-    const wrapped = provider(model).forRequest({
+    expect(() => provider(model).model({ scope: { userId: 'user-1' } })).toThrowError(RedisAgentMemoryToolError);
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     });
     await expect(wrapped.doGenerate(call([
@@ -621,7 +621,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
 
-    const result = await provider(base).forRequest({
+    const result = await provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       onDiagnostic: event => diagnostics.push(event),
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
@@ -649,7 +649,7 @@ describe('Redis Agent Memory provider', () => {
     }));
     const model = new MockLanguageModelV4();
 
-    await expect(provider(model).forRequest({
+    await expect(provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       onDiagnostic: event => diagnostics.push(event),
     }).doGenerate(call([
@@ -699,10 +699,10 @@ describe('Redis Agent Memory provider', () => {
       usage, warnings: [],
     }) });
     const memory = provider(winnerModel);
-    const winner = memory.forRequest({
+    const winner = memory.model({
       scope: { userId: 'user-1', sessionId: 'shared-session' }, assistantId: 'assistant-1',
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Winner question.' }] }]));
-    const loser = memory.forRequest({
+    const loser = memory.model({
       scope: { userId: 'user-2', sessionId: 'shared-session' }, assistantId: 'assistant-2',
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Losing question.' }] }]));
 
@@ -741,7 +741,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
     const memory = provider(base);
-    const wrapped = memory.forRequest({
+    const wrapped = memory.model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     });
     const params = call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]);
@@ -753,7 +753,7 @@ describe('Redis Agent Memory provider', () => {
     expect(sessionGets).toBe(3);
     // Restored ownership permits a new request to record; the old latch stays local.
     sessionGets = -10;
-    await memory.forRequest({
+    await memory.model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     }).doGenerate(params);
     expect(posts.map(post => post.role)).toEqual(['USER', 'USER', 'ASSISTANT']);
@@ -766,7 +766,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: ++calls === 1 ? 'TOO-LONG' : 'OK' }],
       finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    const wrapped = provider(base).forRequest({
+    const wrapped = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { recordingChars: 3 },
     });
@@ -788,7 +788,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: answer }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
 
-    const result = await provider(base).forRequest({
+    const result = await provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { recordingChars: 60_000 },
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Q' }] }]));
@@ -805,7 +805,7 @@ describe('Redis Agent Memory provider', () => {
       return { content: [{ type: 'text', text: 'Next.' }],
         finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
     } });
-    await provider(reader).forRequest({
+    await provider(reader).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false,
       limits: { sessionChars: 60_000 },
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Continue.' }] }]));
@@ -826,7 +826,7 @@ describe('Redis Agent Memory provider', () => {
       return { content: [{ type: 'text', text: 'Answer.' }],
         finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
     } });
-    const wrapped = provider(base).forRequest({
+    const wrapped = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     });
     const params = call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]);
@@ -857,7 +857,7 @@ describe('Redis Agent Memory provider', () => {
       throw new Error('POST must not start after cancellation.');
     }));
     const model = new MockLanguageModelV4();
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { writeTimeoutMs: 10_000 },
     });
@@ -885,7 +885,7 @@ describe('Redis Agent Memory provider', () => {
       providerMetadata: baseMetadata,
     }) });
 
-    const result = await provider(base).forRequest({
+    const result = await provider(base).model({
       historyMode: 'application', recording: false, includeMemoryProvenance: true,
       scope: { userId: 'user-1' },
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
@@ -911,7 +911,7 @@ describe('Redis Agent Memory provider', () => {
       id: 'memory-1', text: 'Foreign.', createdAt: timestamp, updatedAt: timestamp, ...memory,
     }] });
     const model = new MockLanguageModelV4();
-    const wrapped = provider(model).forRequest({
+    const wrapped = provider(model).model({
       historyMode: 'application', recording: false,
       scope: { userId: 'user-1', ...(code === 'NAMESPACE_SCOPE_MISMATCH' ? { namespaceId: 'namespace-1' } : {}) },
     });
@@ -942,7 +942,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'Completed answer.' }],
       finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    const generated = provider(base).forRequest({
+    const generated = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }], controller.signal));
     await started;
@@ -967,7 +967,7 @@ describe('Redis Agent Memory provider', () => {
     const base = new MockLanguageModelV4({ doGenerate: async () => ({
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    const wrapped = provider(base).forRequest({
+    const wrapped = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
       limits: { writeTimeoutMs: 20 },
     });
@@ -996,7 +996,7 @@ describe('Redis Agent Memory provider', () => {
     const base = new MockLanguageModelV4({ doGenerate: async () => ({
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
-    await expect(provider(base).forRequest({
+    await expect(provider(base).model({
       historyMode: 'application', recording: false, scope: { userId: 'user-1' }, onDiagnostic: callback,
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]))).resolves.toBeDefined();
     expect(callback.mock.calls.length).toBeGreaterThanOrEqual(3);
@@ -1019,7 +1019,7 @@ describe('Redis Agent Memory provider', () => {
       content: [{ type: 'text', text: 'Answer.' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [],
     }) });
 
-    await provider(model).forRequest({
+    await provider(model).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, recording: false,
       onDiagnostic: event => events.push(event),
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'PROMPT SENTINEL' }] }]));
@@ -1051,7 +1051,7 @@ describe('Redis Agent Memory provider', () => {
       return { content: [{ type: 'text', text: 'Answer.' }],
         finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] };
     } });
-    const model = provider(base).forRequest({
+    const model = provider(base).model({
       scope: { userId: 'user-1', sessionId: 'session-1' }, assistantId: 'assistant-1',
     });
 
@@ -1079,7 +1079,7 @@ describe('Redis Agent Memory provider', () => {
       providerMetadata,
     }) });
 
-    const result = await provider(base).forRequest({
+    const result = await provider(base).model({
       historyMode: 'application', recording: false, includeMemoryProvenance: true,
       scope: { userId: 'user-1' }, onDiagnostic: event => diagnostics.push(event),
     }).doGenerate(call([{ role: 'user', content: [{ type: 'text', text: 'Question.' }] }]));
