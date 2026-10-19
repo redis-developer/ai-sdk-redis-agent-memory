@@ -10,7 +10,7 @@ if (Number(process.versions.node.split('.')[0]) < 22) {
   process.exit(1);
 }
 
-const [{ anthropic }, { ToolLoopAgent, isStepCount, APICallError, LoadAPIKeyError }, { createRedisAgentMemoryTools, instructions, RedisAgentMemoryToolError }] =
+const [{ anthropic }, { ToolLoopAgent, isStepCount, APICallError, LoadAPIKeyError }, { createRedisAgentMemory, instructions, RedisAgentMemoryToolError }] =
   await Promise.all([
     import('@ai-sdk/anthropic'),
     import('ai'),
@@ -30,7 +30,7 @@ try {
 const required = ['ANTHROPIC_API_KEY', 'AGENT_MEMORY_API_KEY', 'AGENT_MEMORY_STORE_ID'];
 const missing = required.filter(name => !process.env[name]?.trim());
 if (missing.length) {
-  console.error(`Set ${missing.join(', ')} in demo/.env (see .env.example).`);
+  console.error(`Set ${missing.join(', ')} in demo/tools/.env (see .env.example).`);
   process.exit(1);
 }
 
@@ -61,7 +61,7 @@ function logMemoryError(operation, error) {
 
 function createConversation(memory) {
   const sessionId = randomUUID();
-  const tools = memory.withContext({ sessionId });
+  const tools = memory.tools({ scope: { userId, sessionId } });
   const sessionObservers = {
     onEventStart: ({ role }) => logMemory(`add_session_event (${role})`),
     onEventSaved: ({ role }) => logMemory(`${role} session event saved.`),
@@ -119,12 +119,12 @@ Only claim a fact was saved after checking the tool's created and errors fields.
 let memory;
 let conversation;
 try {
-  memory = createRedisAgentMemoryTools(
-    process.env.AGENT_MEMORY_URL,
-    process.env.AGENT_MEMORY_STORE_ID,
-    process.env.AGENT_MEMORY_API_KEY,
-    { userId },
-  );
+  memory = createRedisAgentMemory({
+    serverUrl: process.env.AGENT_MEMORY_URL,
+    storeId: process.env.AGENT_MEMORY_STORE_ID,
+    apiKey: process.env.AGENT_MEMORY_API_KEY,
+    scope: { userId },
+  });
   conversation = createConversation(memory);
 } catch (error) {
   console.error('Could not initialize the demo. Check the configuration details below.');

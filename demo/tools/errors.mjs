@@ -22,12 +22,12 @@ export function getErrorHelp(error, service) {
     return { summary: 'Memory scope validation failed.', next: 'Check the configured user/session IDs and ownership of the requested resource.' };
   }
   if (codes.has('AI_LoadAPIKeyError')) {
-    return { summary: `The ${service} API key could not be loaded.`, next: `Check ${key} in demo/.env and your shell, then restart the demo.` };
+    return { summary: `The ${service} API key could not be loaded.`, next: `Check ${key} in demo/tools/.env and your shell, then restart the demo.` };
   }
   if (status === 401) {
     return {
       summary: `${service} rejected authentication (HTTP 401).`,
-      next: `Check ${key}. Exported shell values override demo/.env; restart after changing it.`,
+      next: `Check ${key}. Exported shell values override demo/tools/.env; restart after changing it.`,
     };
   }
   if (status === 403) {

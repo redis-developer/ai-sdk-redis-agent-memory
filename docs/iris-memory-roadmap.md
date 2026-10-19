@@ -1,6 +1,6 @@
 # Iris memory integration roadmap
 
-The first release delivers an independent, request-scoped model wrapper with default Iris session restoration, automatic personal long-term recall, and best-effort session recording enabled by default in Iris-managed mode. Applications can explicitly disable recording or manage history themselves; application-managed mode retains opt-in recording. The [v1 design](iris-memory-wrapper-plan.md) documents the implemented API and boundaries. The current API configures the underlying model and Iris connection once with `createRedisAgentMemoryProvider({ model, ...connection })`, then creates isolated models with `memory.forRequest(options)` for each application request. Steps and retries within a request reuse that model; independent requests do not.
+The first release delivers an independent, request-scoped model wrapper with default Iris session restoration, automatic personal long-term recall, and best-effort session recording enabled by default in Iris-managed mode. Applications can explicitly disable recording or manage history themselves; application-managed mode retains opt-in recording. The [v1 design](iris-memory-wrapper-plan.md) documents the implemented API and boundaries. The current root API creates both products with `createRedisAgentMemory({ ...connection, scope?, model? })`. Applications use `memory.tools({ scope? })` for explicit tools and create isolated automatic-memory models with `memory.model({ scope?, model?, ...options })` for each application request. Factory scope and model are optional defaults; a defined call-level scope replaces the whole default scope. Steps and retries within a request reuse that model; independent requests do not.
 
 Optional memory provenance is included in v1: applications can inspect IDs and safe metadata for long-term memories supplied as context, without exposing raw memory text by default.
 
@@ -30,7 +30,7 @@ Revisit after evaluating missed recall with the latest-user-text baseline. Measu
 
 Prerequisites: explicit application lifecycle/storage integration and a verified server idempotency or equivalent atomic deduplication/reconciliation contract before promising exactly-once effects. A queue or outbox alone does not close ambiguous remote success. Retention, ordering, retry limits, and dead-letter handling need a separate design.
 
-**Automatic agent-level request lifecycle integration.** Passing the reusable factory as `model: memory` to a singleton agent is not supported. Applications explicitly call `forRequest()` inside each request; an automatic lifecycle adapter remains separate future work.
+**Automatic agent-level request lifecycle integration.** Passing the reusable factory as `model: memory` to a singleton agent is not supported. Applications explicitly call `memory.model()` inside each request; an automatic lifecycle adapter remains separate future work.
 
 **Complete application turn recording.** An optional run-level adapter could record the user input and only the final user-facing response rather than intermediate assistant text. The v1 decision favors standalone model integration and accepts recording successful intermediate assistant text; final-answer-only behavior remains deferred.
 

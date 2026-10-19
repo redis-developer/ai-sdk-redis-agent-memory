@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -321,4 +321,16 @@ test('/new and /quit do not call a model or memory service', () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /New conversation/);
   assert.deepEqual(result.requests, []);
+});
+
+// Migration contract: retain the real CLI behavior tests above.
+test('tools demo uses the unified factory and resolves the root library', () => {
+  const source = readFileSync(entrypoint, 'utf8');
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.match(source, /createRedisAgentMemory\(/);
+  assert.match(source, /memory\.tools\(/);
+  assert.doesNotMatch(source, /createRedisAgentMemoryTools|new RedisAgentMemory/);
+  assert.equal(manifest.dependencies['ai-sdk-redis-agent-memory'], 'file:../..');
+  assert.equal(realpathSync(fileURLToPath(import.meta.resolve('ai-sdk-redis-agent-memory'))),
+    realpathSync(fileURLToPath(new URL('../../../dist/index.js', import.meta.url))));
 });

@@ -13,6 +13,13 @@ to verify runtime exports and TypeScript declarations. The package check needs
 access to the npm registry/cache. Tests use mocked transports and models; no
 Redis or model credentials are needed and no live API calls are made.
 
+To run the tools demo tests after building the library:
+
+```sh
+npm --prefix demo/tools ci
+npm --prefix demo/tools test
+```
+
 Useful commands:
 
 - `npm run build`: clean and compile the publishable ESM output.
@@ -29,7 +36,7 @@ Useful commands:
 src/                 Library implementation and public entry point
 test/                Unit and integration tests with mocked HTTP/model boundaries
 scripts/             Package validation tooling
-demo/                Minimal terminal chat (private; excluded from npm releases)
+demo/tools/          Tools-based terminal chat (private; excluded from npm releases)
 dist/                Generated JavaScript, declarations, and maps (not committed)
 ```
 
