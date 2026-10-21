@@ -1,4 +1,4 @@
-import { AgentMemory } from '@redis-iris/agent-memory';
+import type { AgentMemory } from '@redis-iris/agent-memory';
 import type { LongTermMemoryFilter } from '@redis-iris/agent-memory/models';
 import { tool, type ToolSet } from 'ai';
 import { z } from 'zod';
@@ -6,29 +6,58 @@ import * as s from './schemas.js';
 import { createNamespaceTools } from './namespaces.js';
 import { RedisAgentMemoryToolError, sanitizeMemoryError } from './errors.js';
 import { createSessionEventHook, type SessionEventHook, type SessionEventHookOptions } from './session-event-hook.js';
+import {
+  copyMemoryScope,
+  createScopedMemory,
+  extendMemoryScope,
+  resolveAgentMemoryClient,
+  type RedisAgentMemoryScope,
+} from './scoped-memory.js';
+import {
+  assertConfiguredLanguageModel,
+  createRedisAgentMemoryModel,
+  type ConfiguredLanguageModel,
+  type RedisAgentMemoryModel,
+  type RedisAgentMemoryModelOptions,
+} from './provider.js';
 export { instructions } from './instructions.js';
 export { RedisAgentMemoryToolError } from './errors.js';
+export type {
+  ConfiguredLanguageModel,
+  RedisAgentMemoryDiagnostic, RedisAgentMemoryDiagnosticError,
+  RedisAgentMemoryLimits, RedisAgentMemoryModel, RedisAgentMemoryModelOptions,
+  RedisAgentMemoryProvenance, RedisAgentMemoryProvenanceEntry,
+} from './provider.js';
 export type {
   SessionEventHook, SessionEventHookInput, SessionEventHookOptions,
   SessionHookEvent, SessionEventHookErrorContext,
 } from './session-event-hook.js';
-
-export interface RedisAgentMemoryScope {
-  /** Stable application user ID. Used as the memory owner and as the actor for USER events. */
-  userId?: string;
-  /** Locks session operations and associates new memories; recall still spans this user's sessions. */
-  sessionId?: string;
-  /** Deprecated label; prefer namespaceId for resource-backed namespaces. */
-  namespace?: string;
-  namespaceId?: string;
-}
-export interface RedisAgentMemoryOptions {
+export type { RedisAgentMemoryScope } from './scoped-memory.js';
+interface RedisAgentMemoryToolOptions {
   /** Expose deletion tools. Defaults to false. */
   allowDeletes?: boolean;
   /** Expose namespace administration tools. Defaults to false. */
   namespaceTools?: boolean;
   /** HTTP request timeout in milliseconds. Defaults to 30,000. Must be positive and finite. */
   timeoutMs?: number;
+}
+
+interface RedisAgentMemoryBaseOptions extends RedisAgentMemoryToolOptions {
+  serverUrl?: string;
+  storeId?: string;
+  apiKey?: string;
+  /** Overridable default. Derive scopes and overrides from trusted, authenticated application state. */
+  scope?: RedisAgentMemoryScope;
+}
+
+export type RedisAgentMemoryOptions<DefaultModel extends ConfiguredLanguageModel | undefined = undefined> =
+  RedisAgentMemoryBaseOptions & (undefined extends DefaultModel
+    ? { /** Optional configured AI SDK model default. Model-name strings are not accepted. */ model?: DefaultModel }
+    : { /** Configured AI SDK model default. Model-name strings are not accepted. */ model: DefaultModel });
+
+export interface RedisAgentMemoryToolsOptions {
+  /** Replaces the entire factory default scope when supplied. */
+  scope?: RedisAgentMemoryScope;
 }
 
 /** A tool map with non-enumerable helpers for scoping and application session recording. */
@@ -39,143 +68,26 @@ export type RedisAgentMemoryTools = ToolSet & {
 };
 
 function fail(message: string): never { throw new RedisAgentMemoryToolError('INVALID_SCOPE', message); }
-function status(error: unknown): number | undefined {
-  return typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
-    ? error.statusCode : undefined;
-}
-
-function copyScope(scope: RedisAgentMemoryScope, options: RedisAgentMemoryOptions): Readonly<RedisAgentMemoryScope> {
-  scope = Object.freeze({ ...scope });
-  if (scope.userId !== undefined) s.ownerId.parse(scope.userId);
-  if (scope.sessionId !== undefined) s.sessionId.parse(scope.sessionId);
-  if (scope.namespaceId !== undefined) s.id.parse(scope.namespaceId);
-  if (scope.namespace !== undefined && !scope.namespace.trim()) throw new Error('scope.namespace must not be empty.');
-  if (scope.namespace !== undefined && scope.namespaceId !== undefined) throw new Error('Choose scope.namespace or scope.namespaceId.');
-  if (options.namespaceTools && scope.namespace !== undefined) throw new Error('Namespace resource tools cannot use a legacy namespace scope.');
-  return scope;
-}
-
-function extendScope(scope: RedisAgentMemoryScope, context: RedisAgentMemoryScope): RedisAgentMemoryScope {
-  const extended = { ...scope };
-  for (const name of ['userId', 'sessionId', 'namespace', 'namespaceId'] as const) {
-    const value = context[name];
-    if (value === undefined) continue;
-    if (scope[name] !== undefined && scope[name] !== value) fail(`Cannot override ${name} scope.`);
-    extended[name] = value;
-  }
-  return extended;
-}
-
-/**
- * Build ordinary AI SDK tools backed by the official Redis SDK. All credentials stay in closures.
- * @param serverUrl Defaults to AGENT_MEMORY_URL, then the production US East endpoint.
- * @param storeId Required here or through AGENT_MEMORY_STORE_ID.
- * @param apiKey Required here or through AGENT_MEMORY_API_KEY.
- * @param scope Fixed user, session, and namespace boundaries, copied at construction.
- * @param options Deletion and namespace administration tools are disabled by default.
- */
-export function createRedisAgentMemoryTools(
-  serverUrl?: string,
-  storeId?: string,
-  apiKey?: string,
-  scope: RedisAgentMemoryScope = {},
-  options: RedisAgentMemoryOptions = {},
-): RedisAgentMemoryTools {
-  const env = typeof process === 'undefined' ? {} : process.env;
-  const key = apiKey ?? env.AGENT_MEMORY_API_KEY;
-  const resolvedStoreId = storeId ?? env.AGENT_MEMORY_STORE_ID;
-  if (!key?.trim()) throw new Error('Set AGENT_MEMORY_API_KEY or pass an Iris API key.');
-  if (!resolvedStoreId?.trim()) throw new Error('Set AGENT_MEMORY_STORE_ID or pass storeId.');
-  const serverURL = serverUrl ?? env.AGENT_MEMORY_URL ?? 'https://gcp-us-east4.memory.redis.io';
-  const url = new URL(serverURL);
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error('serverUrl must be an HTTP(S) URL without credentials, query, or fragment.');
-  }
-  options = Object.freeze({ ...options });
-  scope = copyScope(scope, options);
-  if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)) throw new Error('timeoutMs must be positive.');
-  const client = new AgentMemory({ apiKey: key, storeId: resolvedStoreId, serverURL, timeoutMs: options.timeoutMs ?? 30_000 });
-  return buildTools(client, scope, options);
-}
 
 function buildTools(
   client: AgentMemory,
   scope: Readonly<RedisAgentMemoryScope>,
-  options: Readonly<RedisAgentMemoryOptions>,
+  options: Readonly<RedisAgentMemoryToolOptions>,
 ): RedisAgentMemoryTools {
   const deletes = options.allowDeletes ?? false;
-  type Placement = { namespace?: string; namespaceRef?: { namespaceId: string } };
-  const checkPlacement = (value: Placement) => {
-    if (value.namespace !== undefined && value.namespaceRef !== undefined) fail('Supply namespace or namespaceRef, never both.');
-    if (scope.namespace !== undefined && value.namespace !== scope.namespace) fail('Resource is outside the configured namespace.');
-    if (scope.namespaceId !== undefined && value.namespaceRef?.namespaceId !== scope.namespaceId) fail('Resource is outside the configured namespace resource.');
-  };
-  const place = <T extends Placement>(input: T): T => {
-    const value = { ...input };
-    if (value.namespace !== undefined && value.namespaceRef !== undefined) fail('Supply namespace or namespaceRef, never both.');
-    if (scope.namespace !== undefined) {
-      if (value.namespaceRef || (value.namespace !== undefined && value.namespace !== scope.namespace)) fail('Cannot override namespace scope.');
-      value.namespace = scope.namespace;
-    }
-    if (scope.namespaceId !== undefined) {
-      if (value.namespace !== undefined || (value.namespaceRef && value.namespaceRef.namespaceId !== scope.namespaceId)) fail('Cannot override namespace scope.');
-      value.namespaceRef = { namespaceId: scope.namespaceId };
-    }
-    return value;
-  };
-  const resolveSession = (value?: string) => {
-    if (scope.sessionId && value && value !== scope.sessionId) fail('Cannot override session scope.');
-    const resolved = value ?? scope.sessionId;
-    if (!resolved) fail('Supply sessionId or configure scope.sessionId.');
-    return resolved;
-  };
-  const resolveOwner = (value?: string) => {
-    if (scope.userId && value && value !== scope.userId) fail('Cannot override user scope.');
-    const resolved = value ?? scope.userId;
-    if (!resolved) fail('Supply ownerId or configure scope.userId.');
-    return resolved;
-  };
-  const assertSession = async (sessionId: string, signal?: AbortSignal) => {
-    resolveSession(sessionId);
-    const session = await client.getSessionMemory(sessionId, false, { signal });
-    if (scope.userId && session.ownerId !== scope.userId) fail('Session is outside the configured user scope.');
-    checkPlacement(session);
-    return session;
-  };
-  const assertMemory = async (id: string, signal?: AbortSignal) => {
-    const memory = await client.getLongTermMemory(id, { signal });
-    if (scope.userId && memory.ownerId !== scope.userId) fail('Memory is outside the configured user scope.');
-    checkPlacement(memory);
-    return memory;
-  };
-  const hasResourceScope = Boolean(scope.userId || scope.namespace !== undefined || scope.namespaceId);
-  const assertPlacementOwner = async (value: Placement, signal?: AbortSignal) => {
-    if (!scope.userId || !value.namespaceRef) return;
-    const { namespace } = await client.getNamespace(value.namespaceRef.namespaceId, { signal });
-    const root = namespace.rootId === namespace.namespaceId ? namespace
-      : (await client.getNamespace(namespace.rootId, { signal })).namespace;
-    if (root.scope !== 'PERSONAL' || root.ownerId !== scope.userId) fail('Namespace placement is outside the configured user’s personal namespaces.');
-  };
-  const append = async (input: z.infer<typeof s.event>, signal?: AbortSignal, start = false) => {
-    const placed = place(input);
-    const sessionId = input.sessionId ?? scope.sessionId;
-    if (sessionId) {
-      resolveSession(sessionId);
-      if (hasResourceScope || start) {
-        try {
-          await assertSession(sessionId, signal);
-          if (start) fail('This session already exists; use add_session_event.');
-        } catch (error) {
-          if (status(error) !== 404) throw error;
-          if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) fail('A new session must start with a USER event whose actorId is the configured userId.');
-        }
-      }
-    } else if (scope.userId && (input.actorId !== scope.userId || input.role !== 'USER')) {
-      fail('A new session must start with a USER event whose actorId is the configured userId.');
-    }
-    await assertPlacementOwner(placed, signal);
-    return client.addSessionEvent({ ...placed, sessionId, createdAt: input.createdAt ? new Date(input.createdAt) : new Date() }, { signal });
-  };
+  const scoped = createScopedMemory(client, scope);
+  const {
+    place, resolveSession, resolveOwner, checkPlacement, hasResourceScope,
+  } = scoped;
+  const assertSession = (sessionId: string, signal?: AbortSignal) => scoped.assertSession(sessionId, { signal });
+  const assertMemory = (id: string, signal?: AbortSignal) => scoped.assertMemory(id, { signal });
+  const assertPlacementOwner = (
+    value: { namespace?: string; namespaceRef?: { namespaceId: string } },
+    signal?: AbortSignal,
+  ) => scoped.assertPlacementOwner(value, { signal });
+  const append = (input: z.infer<typeof s.event>, signal?: AbortSignal, start = false) => (
+    scoped.appendSessionEvent(input, { signal, start })
+  );
   const sessionInput = z.object({ sessionId: s.sessionId.optional() });
   const eventInput = sessionInput.extend({ eventId: s.id });
   const tools: ToolSet = {
@@ -262,26 +174,7 @@ function buildTools(
       execute: async (input, { abortSignal }) => {
         const filter: LongTermMemoryFilter = { ...input.filter, createdAt: input.filter?.createdAt
           ? Object.fromEntries(Object.entries(input.filter.createdAt).filter(([,v]) => v !== undefined).map(([k,v]) => [k, new Date(v!)])) : undefined };
-        if (filter.namespace && filter.namespaceRef) fail('Supply namespace or namespaceRef, never both.');
-        if (filter.unnamespaced !== undefined && (filter.namespace || filter.namespaceRef)) fail('unnamespaced cannot be combined with namespace selectors.');
-        if (hasResourceScope && input.filterOp === 'any') fail('Scoped searches require filterOp all to preserve isolation.');
-        const fixed = (name: 'ownerId' | 'namespace' | 'namespaceRef', value: string) => {
-          const existing = filter[name];
-          if (existing && (existing.eq !== value || Object.values(existing).filter(v => v !== undefined).length !== 1)) fail(`Cannot override ${name} scope.`);
-          filter[name] = { eq: value };
-        };
-        if (scope.userId) fixed('ownerId', scope.userId);
-        if (scope.namespace !== undefined || scope.namespaceId) {
-          if (filter.unnamespaced !== undefined) fail('Cannot search unnamespaced records within a namespace scope.');
-          if (scope.namespace !== undefined) {
-            if (filter.namespaceRef) fail('Cannot override namespace scope.');
-            fixed('namespace', scope.namespace);
-          } else {
-            if (filter.namespace) fail('Cannot override namespace scope.');
-            fixed('namespaceRef', scope.namespaceId!);
-          }
-        }
-        return client.searchLongTermMemory({ ...input, filter, filterOp: hasResourceScope ? 'all' : input.filterOp }, { signal: abortSignal });
+        return scoped.searchLongTermMemory({ ...input, filter }, { signal: abortSignal });
       },
     }),
     update_memory: tool({
@@ -343,7 +236,11 @@ function buildTools(
   // Keep application helpers out of AI SDK tool enumeration and object spreads.
   Object.defineProperties(tools, {
     withContext: {
-      value: (context: RedisAgentMemoryScope) => buildTools(client, copyScope(extendScope(scope, context), options), options),
+      value: (context: RedisAgentMemoryScope) => buildTools(
+        client,
+        copyMemoryScope(extendMemoryScope(scope, context), options),
+        options,
+      ),
     },
     createSessionEventHook: {
       value: (hookOptions: SessionEventHookOptions) => createSessionEventHook(scope, append, hookOptions),
@@ -352,25 +249,62 @@ function buildTools(
   return tools as RedisAgentMemoryTools;
 }
 
-const RedisAgentMemoryConstructor = class RedisAgentMemory {
-  constructor(
-    serverUrl?: string,
-    storeId?: string,
-    apiKey?: string,
-    scope: RedisAgentMemoryScope = {},
-    options: RedisAgentMemoryOptions = {},
-  ) {
-    Object.defineProperties(this, Object.getOwnPropertyDescriptors(
-      createRedisAgentMemoryTools(serverUrl, storeId, apiKey, scope, options),
-    ));
+type ModelCallWithDefault = (options?: RedisAgentMemoryModelOptions) => RedisAgentMemoryModel;
+type ModelCallWithoutDefault = (
+  options: RedisAgentMemoryModelOptions & { model: ConfiguredLanguageModel },
+) => RedisAgentMemoryModel;
+
+export type RedisAgentMemory<DefaultModel extends ConfiguredLanguageModel | undefined = undefined> = Readonly<{
+  tools: (options?: RedisAgentMemoryToolsOptions) => RedisAgentMemoryTools;
+  model: undefined extends DefaultModel ? ModelCallWithoutDefault : ModelCallWithDefault;
+}>;
+
+/**
+ * Create one immutable Redis Agent Memory factory and share its Iris client across tools and request models.
+ * Each `model()` call returns fresh request-local state and must be reused only within one application request.
+ */
+export function createRedisAgentMemory<DefaultModel extends ConfiguredLanguageModel | undefined = undefined>(
+  input: RedisAgentMemoryOptions<DefaultModel>,
+): RedisAgentMemory<DefaultModel> {
+  const options = Object.freeze({ ...input });
+  if (options.model !== undefined) assertConfiguredLanguageModel(options.model);
+  const defaultScope = copyMemoryScope(options.scope ?? {}, options);
+  const toolOptions: Readonly<RedisAgentMemoryToolOptions> = Object.freeze({
+    allowDeletes: options.allowDeletes,
+    namespaceTools: options.namespaceTools,
+    timeoutMs: options.timeoutMs,
+  });
+  let client: ReturnType<typeof resolveAgentMemoryClient>;
+  try {
+    client = resolveAgentMemoryClient(
+      options.serverUrl,
+      options.storeId,
+      options.apiKey,
+      options.timeoutMs ?? 30_000,
+    );
+  } catch (error) {
+    throw new RedisAgentMemoryToolError(
+      'INVALID_CONFIGURATION',
+      error instanceof Error ? error.message : 'Redis Agent Memory connection configuration is invalid.',
+    );
   }
-};
-
-export type RedisAgentMemory = RedisAgentMemoryTools;
-
-// Expose the tool-map intersection at the constructor boundary so withContext remains a method, not a tool.
-/** Pass directly as `tools: new RedisAgentMemory(serverUrl, storeId, apiKey, scope, options)`. Only tools are enumerable. */
-export const RedisAgentMemory = RedisAgentMemoryConstructor as unknown as {
-  new (...args: ConstructorParameters<typeof RedisAgentMemoryConstructor>): RedisAgentMemory;
-  readonly prototype: RedisAgentMemory;
-};
+  const defaultModel = options.model;
+  const memory = {
+    tools(callOptions: RedisAgentMemoryToolsOptions = {}) {
+      const scope = callOptions.scope === undefined
+        ? defaultScope
+        : copyMemoryScope(callOptions.scope, toolOptions);
+      return buildTools(client, scope, toolOptions);
+    },
+    model(callOptions: RedisAgentMemoryModelOptions = {}) {
+      const selectedModel = callOptions.model === undefined ? defaultModel : callOptions.model;
+      assertConfiguredLanguageModel(selectedModel);
+      const scope = callOptions.scope === undefined
+        ? defaultScope
+        : copyMemoryScope(callOptions.scope);
+      const { model: _model, ...requestOptions } = callOptions;
+      return createRedisAgentMemoryModel(client, selectedModel, { ...requestOptions, scope });
+    },
+  };
+  return Object.freeze(memory) as RedisAgentMemory<DefaultModel>;
+}

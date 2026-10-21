@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ToolLoopAgent, type ModelMessage } from 'ai';
 import { MockLanguageModelV4, convertArrayToReadableStream } from 'ai/test';
 import {
-  RedisAgentMemory, RedisAgentMemoryToolError, createRedisAgentMemoryTools,
+  createRedisAgentMemory, RedisAgentMemoryToolError,
   type SessionEventHook, type SessionEventHookOptions, type SessionEventHookInput,
-  type SessionHookEvent, type SessionEventHookErrorContext,
+  type SessionHookEvent, type SessionEventHookErrorContext, type RedisAgentMemoryScope,
 } from '../src/index.js';
 
 const serverURL = 'https://hook.example.test';
@@ -60,8 +60,17 @@ function transport(options: {
   return { writes, requests, fetch };
 }
 
+function makeTools(
+  serverUrl?: string,
+  storeId?: string,
+  key?: string,
+  memoryScope: RedisAgentMemoryScope = {},
+) {
+  return createRedisAgentMemory({ serverUrl, storeId, apiKey: key, scope: memoryScope }).tools();
+}
+
 function tools() {
-  return createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, scope);
+  return makeTools(serverURL, 'store-1', apiKey, scope);
 }
 
 function userInput(messages: readonly ModelMessage[] = [{ role: 'user', content: 'Hello.' }]): SessionEventHookInput<'USER'> {
@@ -73,13 +82,12 @@ function assistantInput(text = 'Hello back.'): SessionEventHookInput<'ASSISTANT'
 }
 
 describe('createSessionEventHook', () => {
-  it('is a typed, non-enumerable helper on constructor, factory, and derived toolsets', () => {
-    const constructed = new RedisAgentMemory(serverURL, 'store-1', apiKey, scope);
+  it('is a typed, non-enumerable helper on factory and derived toolsets', () => {
     const factory = tools();
-    const derived = createRedisAgentMemoryTools(serverURL, 'store-1', apiKey).withContext(scope);
+    const derived = makeTools(serverURL, 'store-1', apiKey).withContext(scope);
     const options: SessionEventHookOptions<'USER'> = { role: 'USER', actorId: 'user-1', onError: vi.fn() };
 
-    for (const memory of [constructed, factory, derived]) {
+    for (const memory of [factory, derived]) {
       const hook: SessionEventHook<'USER'> = memory.createSessionEventHook(options);
       expect(hook).toBeTypeOf('function');
       expect(Object.keys(memory)).not.toContain('createSessionEventHook');
@@ -113,7 +121,7 @@ describe('createSessionEventHook', () => {
   it('requires fixed scope, a valid role and actor, matching USER identity, and valid callbacks', () => {
     const http = transport();
     for (const missing of [{}, { userId: 'user-1' }, { sessionId: 'session-1' }]) {
-      const memory = createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, missing);
+      const memory = makeTools(serverURL, 'store-1', apiKey, missing);
       expect(() => memory.createSessionEventHook({ role: 'USER', actorId: 'user-1', onError: vi.fn() })).toThrow();
     }
     for (const options of [
@@ -350,7 +358,7 @@ describe('createSessionEventHook', () => {
     const http = transport({ beforeWrite: async event => {
       if (event.sessionId === 'session-1') { notifyStarted(); await released; }
     } });
-    const memory = createRedisAgentMemoryTools(serverURL, 'store-1', apiKey);
+    const memory = makeTools(serverURL, 'store-1', apiKey);
     const onError = vi.fn();
     const first = memory.withContext(scope).createSessionEventHook({ role: 'USER', actorId: 'user-1', onError });
     const second = memory.withContext({ userId: 'user-2', sessionId: 'session-2' })
@@ -414,6 +422,7 @@ describe('createSessionEventHook', () => {
       { actorId: 'user-1', role: 'USER', content: [{ text: 'The question.' }] },
       { actorId: 'assistant-1', role: 'ASSISTANT', content: [{ text: 'The response.' }] },
     ]);
+    expect(http.requests.map(request => request.method)).toEqual(['GET', 'POST', 'GET', 'POST']);
     const modelTools = mode === 'generate' ? model.doGenerateCalls[0]!.tools : model.doStreamCalls[0]!.tools;
     expect(modelTools?.map(tool => tool.name)).not.toContain('createSessionEventHook');
   });

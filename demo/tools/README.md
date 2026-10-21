@@ -16,12 +16,12 @@ use nvm), then run from the repository root:
 ```sh
 npm ci
 npm run build
-cd demo
+cd demo/tools
 npm ci
 cp .env.example .env
 ```
 
-Fill in the three required values in `demo/.env`, then run from `demo/`:
+Fill in the three required values in `demo/tools/.env`, then run from `demo/tools/`:
 
 ```sh
 npm start
@@ -75,8 +75,8 @@ Restarting also starts a fresh session. Keep the same `DEMO_USER_ID` (default:
 `demo-user`) to recall your memories, or change it to try a different user. This
 is a local demo; the user ID is configuration, not authentication.
 
-The demo creates one memory toolset with `createRedisAgentMemoryTools`, binding
-the stable user ID once. Each conversation calls `memory.withContext({ sessionId })`
+The demo creates one memory factory with `createRedisAgentMemory`, binding
+the stable user ID once. Each conversation calls `memory.tools({ scope: { userId, sessionId } })`
 to get its own scoped tools while sharing the original client.
 
 The session ID is printed at startup and after `/new`. The agent uses the
@@ -119,7 +119,7 @@ they do not trigger the AI SDK's tool-execution callbacks.
 The model can read saved history with `get_session_memory`, including the
 current user message once its save succeeds. Tool calls and results stay in
 local model history. The helpers record text only; see the library's
-[session event hook documentation](../README.md#recording-session-events) for
+[session event hook documentation](../../README.md#recording-session-events) for
 input requirements and error context.
 
 The model chooses when to save and search long-term facts. New memories are
@@ -159,17 +159,17 @@ automatically; check saved session history before resubmitting a failed turn.
 ## Verify without credentials
 
 After installing the dependencies and building the local library, run `npm test`
-from `demo/`. The tests run the actual CLI and SDKs with mocked HTTP responses;
+from `demo/tools/`. The tests run the actual CLI and SDKs with mocked HTTP responses;
 they check session logging, recall after `/new`, user/session scoping, failure
 recovery, and console colors. They do not call Anthropic or Redis or load your
 `.env`.
 
 ## Local package
 
-`file:..` uses the library in this checkout, so no npm release is needed. Re-run
+`file:../..` uses the library in this checkout, so no npm release is needed. Re-run
 `npm run build` in the repository root after changing the library source.
 
 This demo has its own dependencies and lockfile and is marked `private: true`.
-The library's publishing allowlist excludes `demo/`, and its package check rejects
+The library's publishing allowlist excludes `demo/tools/`, and its package check rejects
 any demo files in the tarball. `.env` is ignored by Git; `.env.example` contains
 only placeholders.

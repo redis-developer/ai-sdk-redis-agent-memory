@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ToolLoopAgent, isStepCount, type ToolSet } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
 import {
-  RedisAgentMemory, createRedisAgentMemoryTools,
+  createRedisAgentMemory,
   type RedisAgentMemoryOptions, type RedisAgentMemoryScope,
 } from '../src/index.js';
 
@@ -36,28 +36,29 @@ function transport(body: unknown = { items: [] }) {
   return { requests, fetch };
 }
 
+function makeTools(
+  serverUrl?: string,
+  storeId?: string,
+  key?: string,
+  scope: RedisAgentMemoryScope = {},
+  options: RedisAgentMemoryOptions = {},
+) {
+  return createRedisAgentMemory({ ...options, serverUrl, storeId, apiKey: key, scope }).tools();
+}
+
 const creators = [
   {
-    name: 'constructor',
+    name: 'unified factory',
     create: (scope?: RedisAgentMemoryScope, options?: RedisAgentMemoryOptions) =>
-      new RedisAgentMemory(serverURL, 'store-1', apiKey, scope, options),
-    fromEnvironment: () => new RedisAgentMemory(),
-  },
-  {
-    name: 'factory',
-    create: (scope?: RedisAgentMemoryScope, options?: RedisAgentMemoryOptions) =>
-      createRedisAgentMemoryTools(serverURL, 'store-1', apiKey, scope, options),
-    fromEnvironment: () => createRedisAgentMemoryTools(),
+      makeTools(serverURL, 'store-1', apiKey, scope, options),
+    fromEnvironment: () => makeTools(),
   },
 ];
 
-it('preserves constructor subclassing, instance checks, and tool-map typing', async () => {
-  class Derived extends RedisAgentMemory {}
-  const instance: RedisAgentMemory = new Derived(serverURL, 'store-1', apiKey);
+it('preserves tool-map typing and withContext narrowing', async () => {
+  const instance = makeTools(serverURL, 'store-1', apiKey);
   const tools: ToolSet = instance;
 
-  expect(instance).toBeInstanceOf(Derived);
-  expect(instance).toBeInstanceOf(RedisAgentMemory);
   expect(tools).toBe(instance);
   expect(await run(instance.withContext({ userId: 'user-1' }), 'get_memory_context'))
     .toHaveProperty('userId', 'user-1');
