@@ -227,10 +227,10 @@ violations remain hard failures.
 ## Runnable demos
 
 - [`demo/tools/`](demo/tools/) demonstrates the explicit tools and recording-hook approach.
+- [`demo/provider/`](demo/provider/) demonstrates the automatic-memory model approach.
 
-The tools demo has independent installation, test, and startup instructions and
-is excluded from npm releases. The automatic-memory demo is introduced by
-stacked [PR #3](https://github.com/redis-developer/ai-sdk-redis-agent-memory/pull/3).
+Each demo has independent installation, test, and startup instructions and is
+excluded from npm releases.
 
 ## Combining tools
 
