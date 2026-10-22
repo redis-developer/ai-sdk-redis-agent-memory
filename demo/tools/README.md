@@ -119,7 +119,7 @@ they do not trigger the AI SDK's tool-execution callbacks.
 The model can read saved history with `get_session_memory`, including the
 current user message once its save succeeds. Tool calls and results stay in
 local model history. The helpers record text only; see the library's
-[session event hook documentation](../../README.md#recording-session-events) for
+[session event hook documentation](../../TOOLS.md#recording-session-events) for
 input requirements and error context.
 
 The model chooses when to save and search long-term facts. New memories are

@@ -36,6 +36,7 @@
     "dist",
     "src/**/*.ts",
     "README.md",
+    "TOOLS.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
