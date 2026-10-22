@@ -34,3 +34,5 @@ jobs:
       - run: npm run check
       - run: npm --prefix demo/tools ci
       - run: npm --prefix demo/tools test
+      - run: npm --prefix demo/provider ci
+      - run: npm --prefix demo/provider test
