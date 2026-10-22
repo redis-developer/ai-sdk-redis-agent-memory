@@ -222,7 +222,7 @@ The configuration is documented in the project's [README.md](README.md#configura
 ## Tool reference
 
 All parameter names are camelCase.
-IDs remain visible to the model; fixed scopes cannot be overridden. 
+IDs remain visible to the model; fixed scopes cannot be overridden.
 The three deletion tools below are exposed only when `options.allowDeletes` is `true`.
 
 | Tool | Parameters and result |
