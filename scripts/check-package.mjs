@@ -42,7 +42,7 @@ try {
   assert.equal(artifact.filename, basename(artifact.filename), 'Unexpected tarball filename.');
 
   const files = new Set(artifact.files.map(({ path }) => path));
-  const topLevelFiles = new Set(['package.json', 'README.md', 'LICENSE', 'CHANGELOG.md']);
+  const topLevelFiles = new Set(['package.json', 'README.md', 'TOOLS.md', 'LICENSE', 'CHANGELOG.md']);
   for (const path of files) {
     assert(!path.split('/').includes('..'), `Invalid package path: ${path}`);
     assert(
